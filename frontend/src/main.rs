@@ -69,6 +69,8 @@ fn MachineDetailPage() -> impl IntoView {
         can_be_turned_off: false,
         inactivity_period: 60,
         port_forwards: vec![],
+        idle_minutes: None,
+        offline_minutes: None,
     });
 
     // Load initial machine details
@@ -92,10 +94,11 @@ fn MachineDetailPage() -> impl IntoView {
     let (turn_off_feedback, set_turn_off_feedback) = signal::<Option<(bool, String)>>(None);
     let (wake_loading, set_wake_loading) = signal(false);
     let (wake_feedback, set_wake_feedback) = signal::<Option<(bool, String)>>(None);
+    let (turn_off_port_error, set_turn_off_port_error) = signal::<Option<String>>(None);
 
     let can_turn_off_machine = Memo::new(move |_| {
         let machine = machine_details.get();
-        machine.can_be_turned_off && machine.turn_off_port.is_some()
+        machine.can_be_turned_off
     });
 
     // Update form fields when machine details load
@@ -112,6 +115,18 @@ fn MachineDetailPage() -> impl IntoView {
 
     let update_machine = move |ev: SubmitEvent| {
         ev.prevent_default();
+
+        if can_be_turned_off.get() && turn_off_port.get().is_none() {
+            set_turn_off_port_error.set(Some(
+                "A port number is required when remote turn off is enabled. \
+                 This is the port Wakezilla will connect to on the target machine \
+                 to send the shutdown command. The machine must be running the \
+                 Wakezilla client and have it listening on this port."
+                    .to_string(),
+            ));
+            return;
+        }
+        set_turn_off_port_error.set(None);
         set_loading.set(true);
 
         let updated_mac = mac();
@@ -140,6 +155,8 @@ fn MachineDetailPage() -> impl IntoView {
             can_be_turned_off: updated_can_be_turned_off,
             inactivity_period: inactivity_period.get(),
             port_forwards: updated_port_forwards.clone(),
+            idle_minutes: None,
+            offline_minutes: None,
         };
 
         let payload = UpdateMachinePayload {
@@ -346,7 +363,7 @@ fn MachineDetailPage() -> impl IntoView {
 
                     <Show when=move || can_be_turned_off.get() fallback=|| view! { <></> }>
                         <div class="field">
-                            <label for="turn_off_port">"Turn off port (optional)"</label>
+                            <label for="turn_off_port">"Turn off port"</label>
                             <input
                                 type="number"
                                 id="turn_off_port"
@@ -354,6 +371,7 @@ fn MachineDetailPage() -> impl IntoView {
                                 class="input"
                                 min="1"
                                 max="65535"
+                                placeholder="3001"
                                 value=move || {
                                     turn_off_port.get().map(|p| p.to_string()).unwrap_or_default()
                                 }
@@ -362,8 +380,12 @@ fn MachineDetailPage() -> impl IntoView {
                                     let input: HtmlInputElement = target.dyn_into().unwrap();
                                     let value = input.value();
                                     set_turn_off_port.set(value.parse().ok());
+                                    set_turn_off_port_error.set(None);
                                 }
                             />
+                            {move || turn_off_port_error.get().map(|msg| view! {
+                                <p class="error-message">{msg}</p>
+                            })}
                             <p class="field-help">
                                 "Port exposed by the machine to receive shutdown requests."
                             </p>
@@ -634,7 +656,7 @@ fn MachineDetailPage() -> impl IntoView {
                 }}
                 <Show when=move || !can_turn_off_machine.get() fallback=|| view! { <></> }>
                     <p class="field-help">
-                        "Configure a remote shutdown port on the machine to activate this action."
+                        "Enable remote turn off in the settings to activate this action."
                     </p>
                 </Show>
             </div>
@@ -753,6 +775,8 @@ fn Header(
                 local_port: 0,
                 target_port: 0,
             }],
+            idle_minutes: None,
+            offline_minutes: None,
         };
         set_machine.set(new_machine);
         set_discovered_devices.set(vec![]);
@@ -935,6 +959,7 @@ fn RegistredMachines(
                             <th class="hide-mobile">"Port"</th>
                             <th class="hide-mobile">"Turn Off"</th>
                             <th>"Status"</th>
+                            <th class="hide-mobile">"Idle"</th>
                             <th class="hide-mobile">"Forwards"</th>
                             <th>"Actions"</th>
                         </tr>
@@ -945,7 +970,7 @@ fn RegistredMachines(
                             fallback=|| {
                                 view! {
                                     <tr>
-                                        <td colspan=9 class="table-empty">
+                                        <td colspan=10 class="table-empty">
                                             "No machines yet. Use the form below to add one."
                                         </td>
                                     </tr>
@@ -964,6 +989,7 @@ fn RegistredMachines(
                                         .clone()
                                         .unwrap_or_else(|| "-".to_string());
                                     let status_mac = mac_href.clone();
+                                    let idle_mac = mac_href.clone();
                                     let wake_mac_disabled = mac_href.clone();
                                     let wake_mac_click = mac_href.clone();
                                     let wake_mac_task = mac_href.clone();
@@ -1088,6 +1114,39 @@ fn RegistredMachines(
                                                         }
                                                     }
                                                 }}
+                                            </td>
+                                            <td class="hide-mobile">
+                                                <span class="text-xs sm:text-sm">
+                                                    {move || {
+                                                        let key = idle_mac.clone();
+                                                        let is_online = status_machine
+                                                            .get()
+                                                            .get(&key)
+                                                            .cloned()
+                                                            .unwrap_or(false);
+                                                        if is_online {
+                                                            let idle = machines
+                                                                .get()
+                                                                .into_iter()
+                                                                .find(|m| m.mac == key)
+                                                                .and_then(|m| m.idle_minutes);
+                                                            match idle {
+                                                                Some(mins) => format!("{} min", mins),
+                                                                None => "-".to_string(),
+                                                            }
+                                                        } else {
+                                                            let offline_mins = machines
+                                                                .get()
+                                                                .into_iter()
+                                                                .find(|m| m.mac == key)
+                                                                .and_then(|m| m.offline_minutes);
+                                                            match offline_mins {
+                                                                Some(mins) => format!("{}m offline", mins),
+                                                                None => "-".to_string(),
+                                                            }
+                                                        }
+                                                    }}
+                                                </span>
                                             </td>
                                             <td class="hide-mobile">
                                                 <span class="font-mono text-xs sm:text-sm">
@@ -1380,6 +1439,8 @@ fn AddMachine(
                         can_be_turned_off: false,
                         inactivity_period: 60,
                         port_forwards: vec![],
+                        idle_minutes: None,
+                        offline_minutes: None,
                     });
                     set_port_forwards.set(vec![]);
                     set_show_turn_off_port.set(false);
@@ -1762,6 +1823,8 @@ fn HomePage() -> impl IntoView {
             local_port: 0,
             target_port: 0,
         }],
+        idle_minutes: None,
+        offline_minutes: None,
     };
     let (machine, set_machine) = signal::<Machine>(default_machine);
 
