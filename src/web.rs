@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use validator::ValidationError;
 
 use serde::{Deserializer, Serializer};
@@ -41,8 +41,21 @@ fn machines_db_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    // Use current working directory as default (not executable directory)
-    // This ensures the file is saved/loaded from where the user runs the command
+    // Use ~/.local/share/wakezilla/machines.json so the file is stable
+    // regardless of which directory the binary is launched from.
+    if let Some(home) = env::var_os("HOME") {
+        let dir = PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("wakezilla");
+        if let Err(e) = fs::create_dir_all(&dir) {
+            tracing::warn!("Could not create data directory {}: {}", dir.display(), e);
+        } else {
+            return dir.join(DEFAULT_DB_PATH);
+        }
+    }
+
+    // Fallback: current working directory (old behaviour)
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(DEFAULT_DB_PATH)
@@ -124,7 +137,12 @@ pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortF
     }
 }
 
-pub fn machine_to_api_machine(machine: &Machine) -> wakezilla_common::Machine {
+pub fn machine_to_api_machine(
+    machine: &Machine,
+    limiter: Option<&forward::TurnOffLimiter>,
+) -> wakezilla_common::Machine {
+    let idle_minutes = limiter.and_then(|l| l.idle_minutes(machine.ip));
+    let offline_minutes = limiter.and_then(|l| l.offline_minutes_for_mac(&machine.mac));
     wakezilla_common::Machine {
         name: machine.name.clone(),
         mac: machine.mac.clone(),
@@ -138,6 +156,8 @@ pub fn machine_to_api_machine(machine: &Machine) -> wakezilla_common::Machine {
             .iter()
             .map(internal_port_forward_to_api)
             .collect(),
+        idle_minutes,
+        offline_minutes,
     }
 }
 
@@ -200,6 +220,23 @@ pub fn save_machines(machines: &[Machine]) -> Result<()> {
 }
 
 pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
+    // Initialize idle tracking for any machine with port forwards so that
+    // idle_minutes is always available in the API. Turn-off is only triggered
+    // by the inactivity monitor when can_be_turned_off is true.
+    if !machine.port_forwards.is_empty() || machine.can_be_turned_off {
+        let turn_off_port = machine.turn_off_port.unwrap_or(3001);
+        state.turn_off_limiter.initialize_machine(machine, turn_off_port);
+        info!(
+            "Initialized idle tracking for machine {} ({}): {}min inactivity period, can_turn_off={}",
+            machine.mac, machine.ip, machine.inactivity_period, machine.can_be_turned_off
+        );
+    } else {
+        info!(
+            "Machine {} has no port forwards and cannot be turned off, skipping idle tracking",
+            machine.mac
+        );
+    }
+
     for pf in &machine.port_forwards {
         let remote_addr = SocketAddr::new(machine.ip.into(), pf.target_port);
         let local_port = pf.local_port;
