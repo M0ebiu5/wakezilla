@@ -177,35 +177,43 @@ async fn is_machine_on_api(
     State(state): State<AppState>,
     Path(mac): Path<String>,
 ) -> impl IntoResponse {
-    let machines = state.machines.read().await;
-    if let Some(machine) = machines.iter().find(|m| m.mac == mac) {
-        let url = format!(
-            "http://{}:{}/health",
-            machine.ip,
-            machine.turn_off_port.unwrap_or(3001)
-        );
-        let response = reqwest::get(&url).await;
-        match response {
-            Ok(res) => {
-                if res.status() == 200 {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": true })),
-                    ))
-                } else {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": false })),
-                    ))
-                }
+    let (url, machine_mac, machine_name) = {
+        let machines = state.machines.read().await;
+        match machines.iter().find(|m| m.mac == mac) {
+            Some(machine) => {
+                let url = format!(
+                    "http://{}:{}/health",
+                    machine.ip,
+                    machine.turn_off_port.unwrap_or(3001)
+                );
+                (url, machine.mac.clone(), machine.name.clone())
             }
-            Err(e) => {
-                info!("Network error for machine {}: {}", machine.name, e);
-                Err(axum::http::StatusCode::NOT_FOUND)
+            None => return Err(axum::http::StatusCode::NOT_FOUND),
+        }
+    };
+
+    let response = reqwest::get(&url).await;
+    match response {
+        Ok(res) => {
+            if res.status() == 200 {
+                state.turn_off_limiter.mark_online(&machine_mac);
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": true })),
+                ))
+            } else {
+                state.turn_off_limiter.mark_offline(&machine_mac);
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": false })),
+                ))
             }
         }
-    } else {
-        Err(axum::http::StatusCode::NOT_FOUND)
+        Err(e) => {
+            info!("Network error for machine {}: {}", machine_name, e);
+            state.turn_off_limiter.mark_offline(&machine_mac);
+            Err(axum::http::StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -261,6 +269,8 @@ async fn add_machine_api(
             .inactivity_period
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.unwrap_or_default(),
+        idle_minutes: None,
+        offline_minutes: None,
     };
     let new_machine = match web::api_machine_to_internal(&api_machine) {
         Ok(machine) => machine,
@@ -294,10 +304,11 @@ async fn add_machine_api(
 async fn show_machines_api(State(state): State<AppState>) -> impl IntoResponse {
     let mut machines = state.machines.read().await.clone();
     machines.reverse();
+    let limiter = &state.turn_off_limiter;
     Json(
         machines
             .iter()
-            .map(web::machine_to_api_machine)
+            .map(|m| web::machine_to_api_machine(m, Some(limiter)))
             .collect::<Vec<_>>(),
     )
 }
@@ -308,7 +319,10 @@ async fn get_machine_details_api(
 ) -> Result<Json<wakezilla_common::Machine>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let machines = state.machines.read().await;
     if let Some(machine) = machines.iter().find(|m| m.mac == mac).cloned() {
-        Ok(Json(web::machine_to_api_machine(&machine)))
+        Ok(Json(web::machine_to_api_machine(
+            &machine,
+            Some(&state.turn_off_limiter),
+        )))
     } else {
         Err((
             axum::http::StatusCode::NOT_FOUND,
@@ -349,6 +363,8 @@ async fn update_machine_api(
             .inactivity_period
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.clone().unwrap_or_default(),
+        idle_minutes: None,
+        offline_minutes: None,
     };
     let new_machine = match web::api_machine_to_internal(&api_machine) {
         Ok(machine) => machine,
@@ -389,6 +405,12 @@ async fn update_machine_api(
             proxies.remove(&key);
         }
         drop(proxies);
+    }
+
+    // Remove old machine from inactivity monitor; it will be re-added
+    // by start_proxy_if_configured only if can_be_turned_off is true.
+    if let Some(ref old) = old_machine {
+        state.turn_off_limiter.remove_machine(old.ip);
     }
 
     // Restart proxy with updated configuration
@@ -444,6 +466,7 @@ async fn execute_remote_turn_off(state: &AppState, mac: &str) -> (axum::http::St
 
     if let Some(machine) = machine {
         if let Some(port) = machine.turn_off_port {
+            state.turn_off_limiter.update_last_request(machine.ip);
             info!("Sending turn-off request to {}:{}", machine.ip, port);
             match forward::turn_off_remote_machine(&machine.ip.to_string(), port).await {
                 Ok(_) => {
@@ -497,14 +520,24 @@ async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusC
         }
     };
 
+    let machine_ip = {
+        let machines = state.machines.read().await;
+        machines.iter().find(|m| m.mac == mac_input).map(|m| m.ip)
+    };
+
     let port = state.config.wol.default_port;
     let count = state.config.wol.default_packet_count;
 
     match crate::wol::send_packets(&parsed_mac, port, count, &state.config).await {
-        Ok(_) => (
-            axum::http::StatusCode::OK,
-            format!("Sent WOL packet to {}", mac_input),
-        ),
+        Ok(_) => {
+            if let Some(ip) = machine_ip {
+                state.turn_off_limiter.update_last_request(ip);
+            }
+            (
+                axum::http::StatusCode::OK,
+                format!("Sent WOL packet to {}", mac_input),
+            )
+        }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to send WOL packet to {}: {}", mac_input, e),

@@ -28,7 +28,8 @@ fn main() {
 
     let is_release = env::var("PROFILE").as_deref() == Ok("release");
     let frontend_index = frontend_dist_dir.join("index.html");
-    let must_build = is_release || !frontend_index.is_file();
+    let skip_frontend = env::var("WAKEZILLA_SKIP_FRONTEND_BUILD").is_ok();
+    let must_build = !skip_frontend && (is_release || !frontend_index.is_file());
 
     // Keep debug builds fast when frontend assets already exist.
     if !must_build {

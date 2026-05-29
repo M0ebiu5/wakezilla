@@ -25,7 +25,7 @@ fn machine_maps_to_api_shape() {
         port_forwards: vec![],
     };
 
-    let api = machine_to_api_machine(&machine);
+    let api = machine_to_api_machine(&machine, None);
     assert_eq!(api.ip, "192.168.1.10");
     assert_eq!(api.turn_off_port, Some(3001));
 }

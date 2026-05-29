@@ -17,6 +17,13 @@ pub struct Machine {
     pub can_be_turned_off: bool,
     pub inactivity_period: u32,
     pub port_forwards: Vec<PortForward>,
+    /// Idle time in minutes since last proxy activity. Only meaningful
+    /// when the machine is online and tracked by the inactivity monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u64>,
+    /// Minutes since the machine was first detected offline. None when online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_minutes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -61,6 +61,8 @@ mod tests {
             can_be_turned_off: false,
             inactivity_period: 30,
             port_forwards: vec![],
+            idle_minutes: None,
+            offline_minutes: None,
         };
 
         let errors = super::validate_machine_form(&machine);
