@@ -181,14 +181,15 @@ pub struct HealthConfig {
     #[serde(default = "default_rate_limit_sample_interval_secs")]
     pub rate_limit_sample_interval_secs: u64,
 
-    /// Bytes a proxied connection must transfer to count as activity for the
-    /// inactivity monitor (default: 4096).
+    /// Bytes a proxied connection must transfer within one minute to count as
+    /// activity for the inactivity monitor (default: 4096).
     ///
     /// Merely accepting or holding open a connection is not activity: uptime
     /// monitors open a socket on a fixed interval, and an idle browser tab keeps
-    /// a websocket open indefinitely. A connection refreshes the idle timer
-    /// each time another this-many bytes have moved in either direction. Set
-    /// to 0 to restore the old behaviour where every accepted connection counts.
+    /// a websocket open indefinitely, trickling keep-alive traffic. A connection
+    /// refreshes the idle timer each time this many bytes move in either
+    /// direction within a minute. Set to 0 to restore the old behaviour where
+    /// every accepted connection counts.
     #[serde(default = "default_activity_min_bytes")]
     pub activity_min_bytes: u64,
 }

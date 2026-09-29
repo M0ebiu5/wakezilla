@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -30,8 +29,16 @@ struct ConnectionActivity {
     limiter: TurnOffLimiter,
     ip: Ipv4Addr,
     min_bytes: u64,
-    /// Bytes moved since this connection last refreshed the idle timer.
-    bytes: AtomicU64,
+    window: Mutex<ActivityWindow>,
+}
+
+/// How long a connection has to move `min_bytes` for it to count as activity.
+const ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Bytes a connection has moved in the current [`ACTIVITY_WINDOW`].
+struct ActivityWindow {
+    start: Instant,
+    bytes: u64,
 }
 
 impl ConnectionActivity {
@@ -47,29 +54,45 @@ impl ConnectionActivity {
             limiter,
             ip,
             min_bytes,
-            bytes: AtomicU64::new(0),
+            window: Mutex::new(ActivityWindow {
+                start: Instant::now(),
+                bytes: 0,
+            }),
         })
     }
 
-    /// Record `n` bytes moved in either direction. Every `min_bytes` moved
-    /// refreshes the idle timer once.
+    /// Record `n` bytes moved in either direction. Moving `min_bytes` within
+    /// one [`ACTIVITY_WINDOW`] refreshes the idle timer.
     ///
     /// Merely being open is not activity: a long-lived connection such as a
-    /// web app's websocket trickles keep-alive pings for as long as a tab stays
-    /// open, and must not keep the machine awake by existing.
+    /// web app's websocket trickles keep-alive traffic (~150 bytes/min for Open
+    /// WebUI) for as long as a tab stays open. Counting only bytes within a
+    /// window stops that trickle from ever adding up to activity.
     fn record(&self, n: usize) {
+        self.record_at(n, Instant::now());
+    }
+
+    fn record_at(&self, n: usize, now: Instant) {
         if n == 0 {
             return;
         }
-        let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-        if total >= self.min_bytes {
-            self.bytes.fetch_sub(total, Ordering::Relaxed);
-            debug!(
-                "Connection to {} carried {} bytes, counting it as activity",
-                self.ip, total
-            );
-            self.limiter.update_last_request(self.ip);
-        }
+        let total = {
+            let mut window = self.window.lock().unwrap();
+            if now.duration_since(window.start) >= ACTIVITY_WINDOW {
+                window.start = now;
+                window.bytes = 0;
+            }
+            window.bytes += n as u64;
+            if window.bytes < self.min_bytes {
+                return;
+            }
+            std::mem::take(&mut window.bytes)
+        };
+        debug!(
+            "Connection to {} carried {} bytes within {:?}, counting it as activity",
+            self.ip, total, ACTIVITY_WINDOW
+        );
+        self.limiter.update_last_request(self.ip);
     }
 }
 
@@ -626,6 +649,36 @@ mod tests {
         }
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
         assert_eq!(limiter.idle_minutes(TEST_IP), Some(10));
+    }
+
+    #[test]
+    fn slow_keepalive_trickle_never_adds_up_to_activity() {
+        let limiter = tracked_limiter();
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        // Open WebUI's idle websocket: ~150 bytes/min, here for two hours.
+        let start = Instant::now();
+        for minute in 0..120 {
+            activity.record_at(150, start + Duration::from_secs(60 * minute));
+        }
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+    }
+
+    #[test]
+    fn bytes_from_an_expired_window_do_not_count() {
+        let limiter = tracked_limiter();
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        let start = Instant::now();
+        activity.record_at(4000, start);
+        activity.record_at(200, start + ACTIVITY_WINDOW);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+
+        // Within the new window it still counts once the threshold is reached.
+        activity.record_at(3896, start + ACTIVITY_WINDOW + Duration::from_secs(1));
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
     }
 
     #[test]
