@@ -156,7 +156,11 @@ Each machine can be configured with:
    - Forwards traffic once the machine is up
 4. **Automatic Shutdown**: 
    - A **single global inactivity monitor** runs continuously, checking all machines every second
-   - Each machine's `last_request` timestamp is automatically updated whenever a connection is accepted
+   - A machine's `last_request` timestamp is updated by proxied connections that actually carry traffic
+   - Merely accepting a connection does **not** count: an uptime check or dashboard that opens a socket
+     every minute would otherwise hold the idle timer at zero and the machine would never suspend.
+     A connection counts once it has transferred `health.activity_min_bytes` (default 4096) in either
+     direction; set that to `0` to count every accepted connection, as older versions did
    - The monitor compares the time since `last_request` against the configured `inactivity_period` (in minutes)
    - If no requests are received within the inactivity period, a shutdown signal is sent via HTTP to the client
    - When a machine configuration is updated (e.g., inactivity period changed), the monitor is automatically stopped and restarted with the new settings
@@ -209,6 +213,10 @@ this will initialize the backend in watch mode on port 3000
    - Verify the inactivity period is configured correctly (in minutes)
    - Check logs to see when the last request was received for the machine
    - Ensure traffic is actually reaching the proxy (requests update the last_request timestamp)
+   - If the machine never goes idle, look for a monitoring tool polling a forwarded port on a fixed
+     interval. Point it at the Wakezilla server's own port instead, or raise
+     `WAKEZILLA__HEALTH__ACTIVITY_MIN_BYTES` above the size of the response it fetches
+   - Note that a connection also wakes a sleeping machine, so a poller can wake it right back up
 
 ### Logs
 Check the terminal output for detailed logs about:

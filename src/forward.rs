@@ -1,10 +1,14 @@
 use crate::{config::Config, web::Machine, wol};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -12,6 +16,132 @@ use tracing::{debug, error, info, warn};
 
 fn turn_off_url(remote_ip: &str, turn_off_port: u16) -> String {
     format!("http://{}:{}/machines/turn-off", remote_ip, turn_off_port)
+}
+
+/// Tracks how much data has actually flowed through a single proxied
+/// connection and reports it to the limiter only once it has carried real
+/// traffic.
+///
+/// Accepting a connection is not by itself a sign that anyone is using the
+/// machine. Uptime monitors, dashboards and port checks connect on a fixed
+/// interval and transfer little or nothing; counting those as requests pins
+/// the idle timer at zero and the machine never suspends.
+struct ConnectionActivity {
+    limiter: TurnOffLimiter,
+    ip: Ipv4Addr,
+    min_bytes: u64,
+    bytes: AtomicU64,
+    counted: AtomicBool,
+}
+
+impl ConnectionActivity {
+    /// Begin tracking a freshly accepted connection.
+    ///
+    /// A `min_bytes` of 0 restores the old behaviour: the connection is
+    /// registered immediately, before the caller yields, so the inactivity
+    /// monitor cannot tick in between.
+    fn start(limiter: TurnOffLimiter, ip: Ipv4Addr, min_bytes: u64) -> Arc<Self> {
+        let activity = Arc::new(Self {
+            limiter,
+            ip,
+            min_bytes,
+            bytes: AtomicU64::new(0),
+            counted: AtomicBool::new(false),
+        });
+        if min_bytes == 0 {
+            activity.mark_active();
+        }
+        activity
+    }
+
+    /// Record `n` bytes moved in either direction.
+    fn record(&self, n: usize) {
+        if n == 0 || self.counted.load(Ordering::Relaxed) {
+            return;
+        }
+        let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        if total >= self.min_bytes {
+            self.mark_active();
+        }
+    }
+
+    /// Promote this connection to a real request. Only the first call has an
+    /// effect, so the active-connection count stays balanced.
+    fn mark_active(&self) {
+        if self.counted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        debug!(
+            "Connection to {} carried {} bytes, counting it as activity",
+            self.ip,
+            self.bytes.load(Ordering::Relaxed)
+        );
+        self.limiter.update_last_request(self.ip);
+        self.limiter.connection_started(self.ip);
+    }
+
+    /// Release the connection. Connections that never carried enough data were
+    /// never registered, so they leave the idle timer untouched.
+    fn finish(&self) {
+        if self.counted.load(Ordering::SeqCst) {
+            self.limiter.connection_ended(self.ip);
+        }
+    }
+}
+
+/// Wraps one half of a proxied connection so that every byte read from or
+/// written to it is reported to [`ConnectionActivity`].
+///
+/// Wrapping the client side alone covers both directions: reads are bytes the
+/// client sent, writes are bytes the machine sent back.
+struct CountingStream<S> {
+    inner: S,
+    activity: Arc<ConnectionActivity>,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S, activity: Arc<ConnectionActivity>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            this.activity.record(buf.filled().len() - before);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            this.activity.record(*n);
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 struct MachineConfig {
@@ -155,6 +285,34 @@ impl TurnOffLimiter {
         self.update_last_request(ip);
     }
 
+    #[cfg(test)]
+    fn active_connection_count(&self, ip: Ipv4Addr) -> u32 {
+        self.active_connections
+            .lock()
+            .unwrap()
+            .get(&ip)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn secs_since_last_request(&self, ip: Ipv4Addr) -> Option<u64> {
+        let machines = self.machines.lock().unwrap();
+        machines
+            .get(&ip)
+            .map(|config| Instant::now().duration_since(config.last_request).as_secs())
+    }
+
+    /// Backdate a machine's last request so tests can assert whether a code
+    /// path refreshed it, without waiting for real time to pass.
+    #[cfg(test)]
+    fn backdate_last_request(&self, ip: Ipv4Addr, age: Duration) {
+        let mut machines = self.machines.lock().unwrap();
+        if let Some(config) = machines.get_mut(&ip) {
+            config.last_request = Instant::now() - age;
+        }
+    }
+
     pub fn start_inactivity_monitor(&self) -> tokio::task::AbortHandle {
         let limiter = self.clone();
         let handle = tokio::spawn(async move {
@@ -212,16 +370,18 @@ impl TurnOffLimiter {
 
                 for (ip, turn_off_port, mac) in machines_to_check {
                     let remote_ip = ip.to_string();
+                    let limiter = limiter.clone();
                     debug!(
                         "Sending turn-off signal for inactive machine {} (IP: {})",
                         mac, remote_ip
                     );
                     tokio::spawn(async move {
-                        if let Err(e) = turn_off_remote_machine(&remote_ip, turn_off_port).await {
-                            error!(
+                        match turn_off_remote_machine(&remote_ip, turn_off_port).await {
+                            Ok(_) => limiter.mark_offline(&mac),
+                            Err(e) => error!(
                                 "Failed to send turn-off signal for inactive machine {} on {}:{}: {}",
                                 mac, remote_ip, turn_off_port, e
-                            );
+                            ),
                         }
                     });
                 }
@@ -239,9 +399,42 @@ impl TurnOffLimiter {
         config: Arc<Config>,
     ) -> Result<()> {
         let listen_addr = format!("0.0.0.0:{}", local_port);
-        let listener = TcpListener::bind(&listen_addr)
-            .await
-            .with_context(|| format!("Failed to bind TCP listener on {}", listen_addr))?;
+        // Retry on EADDRINUSE to cover the window where a previous listener
+        // for the same port has been signalled to stop but its TcpListener
+        // hasn't been dropped yet (e.g. after update_machine_api re-spawns).
+        const MAX_BIND_ATTEMPTS: u32 = 50;
+        let listener = {
+            let mut attempts: u32 = 0;
+            loop {
+                if !*rx.borrow() {
+                    info!(
+                        "Proxy for {} on port {} cancelled before binding.",
+                        remote_addr, local_port
+                    );
+                    return Ok(());
+                }
+                match TcpListener::bind(&listen_addr).await {
+                    Ok(l) => break l,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AddrInUse
+                            && attempts < MAX_BIND_ATTEMPTS =>
+                    {
+                        attempts += 1;
+                        debug!(
+                            "Port {} in use, retrying bind in 100ms (attempt {}/{})",
+                            local_port, attempts, MAX_BIND_ATTEMPTS
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e).context(format!(
+                            "Failed to bind TCP listener on {}",
+                            listen_addr
+                        )));
+                    }
+                }
+            }
+        };
         info!(
             "TCP Forwarder listening on {}, proxying to {}, inactivity period: {}min",
             listen_addr, remote_addr, machine.inactivity_period
@@ -260,7 +453,7 @@ impl TurnOffLimiter {
                     }
                 }
                 result = listener.accept() => {
-                    let (mut inbound, client_addr) = result
+                    let (inbound, client_addr) = result
                         .context("Failed to accept incoming connection")?;
                     info!(
                         "Accepted connection from {} to forward to {}",
@@ -273,10 +466,17 @@ impl TurnOffLimiter {
                     let machine_ip_clone = machine_ip;
                     let config_clone = Arc::clone(&config);
 
-                    tokio::spawn(async move {
-                        rate_limiter.update_last_request(machine_ip_clone);
-                        rate_limiter.connection_started(machine_ip_clone);
+                    // Accepting a connection is not activity on its own. The
+                    // connection starts unregistered and only refreshes the
+                    // idle timer once it has actually carried data, which the
+                    // CountingStream below reports as bytes are proxied.
+                    let activity = ConnectionActivity::start(
+                        rate_limiter.clone(),
+                        machine_ip_clone,
+                        config_clone.health.activity_min_bytes,
+                    );
 
+                    tokio::spawn(async move {
                         'conn: {
                             let connect_timeout = Duration::from_millis(1000);
                             if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
@@ -332,6 +532,8 @@ impl TurnOffLimiter {
                                 }
                             }
 
+                            rate_limiter.mark_online(&mac_str_clone);
+
                             let mut outbound = match tokio::time::timeout(
                                 Duration::from_secs(30),
                                 tokio::net::TcpStream::connect(remote_addr_clone),
@@ -355,6 +557,10 @@ impl TurnOffLimiter {
                                 }
                             };
 
+                            // Counting the client side covers both directions:
+                            // reads are client -> machine, writes are machine -> client.
+                            let mut inbound = CountingStream::new(inbound, Arc::clone(&activity));
+
                             match copy_bidirectional(&mut inbound, &mut outbound).await {
                                 Ok(_) => {
                                     drop(outbound);
@@ -373,7 +579,7 @@ impl TurnOffLimiter {
                             }
                         }
 
-                        rate_limiter.connection_ended(machine_ip_clone);
+                        activity.finish();
                     });
                 }
             }
@@ -430,6 +636,104 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    const TEST_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+
+    fn test_machine() -> Machine {
+        Machine {
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            ip: TEST_IP,
+            name: "test".to_string(),
+            description: None,
+            turn_off_port: Some(3001),
+            can_be_turned_off: true,
+            inactivity_period: 30,
+            port_forwards: Vec::new(),
+        }
+    }
+
+    fn tracked_limiter() -> TurnOffLimiter {
+        let limiter = TurnOffLimiter::new();
+        limiter.initialize_machine(&test_machine(), 3001);
+        limiter
+    }
+
+    #[test]
+    fn connection_below_threshold_is_not_activity() {
+        let limiter = tracked_limiter();
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        activity.record(100);
+        activity.record(200);
+
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+
+        // Closing a connection that never carried data must not reset the timer
+        // either, otherwise a poller still keeps the machine awake.
+        activity.finish();
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+    }
+
+    #[test]
+    fn connection_at_threshold_counts_as_activity() {
+        let limiter = tracked_limiter();
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        activity.record(4000);
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+
+        activity.record(96);
+        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
+
+        // Further bytes must not double-register the same connection.
+        activity.record(1_000_000);
+        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
+
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+        activity.finish();
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
+    }
+
+    #[test]
+    fn zero_threshold_counts_every_connection() {
+        let limiter = tracked_limiter();
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 0);
+
+        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
+        activity.finish();
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_counts_both_directions() {
+        let limiter = tracked_limiter();
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 8);
+
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut counted = CountingStream::new(client, Arc::clone(&activity));
+
+        // 4 bytes machine -> client: still below the threshold.
+        peer.write_all(b"abcd").await.expect("peer write failed");
+        let mut buf = [0u8; 4];
+        counted.read_exact(&mut buf).await.expect("read failed");
+        assert_eq!(&buf, b"abcd");
+        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+
+        // 4 more bytes client -> machine crosses it.
+        counted.write_all(b"efgh").await.expect("write failed");
+        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
+    }
 
     #[test]
     fn turn_off_url_formats_expected_path() {

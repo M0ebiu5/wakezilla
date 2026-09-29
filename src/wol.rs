@@ -46,7 +46,7 @@ pub async fn send_packets(
 }
 
 /// Poll a TCP port on a host until it becomes reachable or a timeout is hit.
-#[instrument(name = "check_host_reachability", skip(ip))]
+#[instrument(name = "check_host_reachability", skip(ip, _config))]
 pub async fn check_host(
     ip: IpAddr,
     check_tcp_port: u16,

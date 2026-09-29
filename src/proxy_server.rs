@@ -13,11 +13,10 @@ use std::sync::Arc;
 use tokio::{net::TcpListener, sync::RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::forward;
 use crate::scanner;
-#[cfg(test)]
 use crate::web::Machine;
 use crate::web::{self, AppState};
 use crate::wol;
@@ -192,7 +191,21 @@ async fn is_machine_on_api(
         }
     };
 
-    let response = reqwest::get(&url).await;
+    // The dashboard polls this endpoint on a timer, so an unbounded request
+    // would let checks against an unresponsive host pile up. `health_timeout_secs`
+    // already existed for exactly this and was never wired in.
+    let health_timeout = std::time::Duration::from_secs(state.config.server.health_timeout_secs);
+    let response = match tokio::time::timeout(health_timeout, reqwest::get(&url)).await {
+        Ok(result) => result,
+        Err(_) => {
+            info!(
+                "Health check for machine {} timed out after {}s",
+                machine_name, state.config.server.health_timeout_secs
+            );
+            state.turn_off_limiter.mark_offline(&machine_mac);
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        }
+    };
     match response {
         Ok(res) => {
             if res.status() == 200 {
@@ -466,10 +479,11 @@ async fn execute_remote_turn_off(state: &AppState, mac: &str) -> (axum::http::St
 
     if let Some(machine) = machine {
         if let Some(port) = machine.turn_off_port {
-            state.turn_off_limiter.update_last_request(machine.ip);
             info!("Sending turn-off request to {}:{}", machine.ip, port);
             match forward::turn_off_remote_machine(&machine.ip.to_string(), port).await {
                 Ok(_) => {
+                    state.turn_off_limiter.update_last_request(machine.ip);
+                    state.turn_off_limiter.mark_offline(mac);
                     return (
                         axum::http::StatusCode::OK,
                         format!("Sent turn-off request to {}", mac),
@@ -509,6 +523,47 @@ async fn api_turn_off_remote_machine(
     )
 }
 
+/// Poll a machine after its WOL packets went out and record the result.
+///
+/// A magic packet only says "someone asked this host to boot"; it is not
+/// evidence that the host woke. This runs in the background so the wake
+/// request still returns immediately, and flips the machine to online only
+/// once it actually answers.
+fn spawn_wake_verification(state: &AppState, machine: &Machine) {
+    let limiter = state.turn_off_limiter.clone();
+    let config = state.config.clone();
+    let mac = machine.mac.clone();
+    let name = machine.name.clone();
+    let ip = machine.ip;
+    let check_port = machine
+        .turn_off_port
+        .unwrap_or(state.config.server.client_port);
+    let wait_secs = state.config.wol.default_wait_secs;
+
+    tokio::spawn(async move {
+        let is_up = wol::check_host(
+            std::net::IpAddr::V4(ip),
+            check_port,
+            wait_secs,
+            config.wol.default_poll_interval_ms,
+            config.wol.default_connect_timeout_ms,
+            &config,
+        )
+        .await;
+
+        if is_up {
+            info!("Machine {} ({}) came up after WOL", name, mac);
+            limiter.mark_online(&mac);
+        } else {
+            warn!(
+                "Machine {} ({}) did not become reachable on port {} within {}s after WOL",
+                name, mac, check_port, wait_secs
+            );
+            limiter.mark_offline(&mac);
+        }
+    });
+}
+
 async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusCode, String) {
     let parsed_mac = match wol::parse_mac(mac_input) {
         Ok(mac) => mac,
@@ -520,24 +575,36 @@ async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusC
         }
     };
 
-    let machine_ip = {
+    let machine = {
         let machines = state.machines.read().await;
-        machines.iter().find(|m| m.mac == mac_input).map(|m| m.ip)
+        machines.iter().find(|m| m.mac == mac_input).cloned()
     };
 
     let port = state.config.wol.default_port;
     let count = state.config.wol.default_packet_count;
 
     match crate::wol::send_packets(&parsed_mac, port, count, &state.config).await {
-        Ok(_) => {
-            if let Some(ip) = machine_ip {
-                state.turn_off_limiter.update_last_request(ip);
+        Ok(_) => match machine {
+            Some(machine) => {
+                state.turn_off_limiter.update_last_request(machine.ip);
+                // Deliberately not marked online here: the machine is still
+                // booting, and claiming otherwise is what made the idle
+                // monitor try to shut down an already-off host.
+                let wait_secs = state.config.wol.default_wait_secs;
+                spawn_wake_verification(state, &machine);
+                (
+                    axum::http::StatusCode::OK,
+                    format!(
+                        "Sent WOL packet to {}; waiting up to {}s for it to come up",
+                        machine.name, wait_secs
+                    ),
+                )
             }
-            (
+            None => (
                 axum::http::StatusCode::OK,
                 format!("Sent WOL packet to {}", mac_input),
-            )
-        }
+            ),
+        },
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to send WOL packet to {}: {}", mac_input, e),

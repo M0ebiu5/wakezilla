@@ -180,6 +180,17 @@ pub struct HealthConfig {
     /// Rate limiting sampling interval in seconds (default: 1)
     #[serde(default = "default_rate_limit_sample_interval_secs")]
     pub rate_limit_sample_interval_secs: u64,
+
+    /// Bytes a proxied connection must transfer before it counts as activity
+    /// for the inactivity monitor (default: 4096).
+    ///
+    /// Merely accepting a connection is not activity: uptime monitors and
+    /// health checks open a socket on a fixed interval, and counting those
+    /// keeps a machine awake forever. A connection only refreshes the idle
+    /// timer once this many bytes have moved in either direction. Set to 0 to
+    /// restore the old behaviour where every accepted connection counts.
+    #[serde(default = "default_activity_min_bytes")]
+    pub activity_min_bytes: u64,
 }
 
 impl Default for HealthConfig {
@@ -190,6 +201,7 @@ impl Default for HealthConfig {
             proxy_wol_wait_secs: default_proxy_wol_wait_secs(),
             system_shutdown_sleep_secs: default_system_shutdown_sleep_secs(),
             rate_limit_sample_interval_secs: default_rate_limit_sample_interval_secs(),
+            activity_min_bytes: default_activity_min_bytes(),
         }
     }
 }
@@ -249,6 +261,9 @@ fn default_system_shutdown_sleep_secs() -> u64 {
 }
 fn default_rate_limit_sample_interval_secs() -> u64 {
     1
+}
+fn default_activity_min_bytes() -> u64 {
+    4096
 }
 
 /// Convenience functions to get commonly used values

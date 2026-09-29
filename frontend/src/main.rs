@@ -26,6 +26,13 @@ use crate::models::{
     validate_machine_form,
 };
 
+/// How often the dashboard re-checks whether each machine is reachable.
+///
+/// Status is polled rather than pushed, so without this the indicators would
+/// keep showing whatever was true at page load: a machine that booted after a
+/// wake (or was shut down by the idle monitor) would still read as it did then.
+const STATUS_REFRESH_SECS: u64 = 10;
+
 #[component]
 pub fn ErrorDisplay(
     erros: ReadSignal<HashMap<String, Vec<String>>>,
@@ -1831,6 +1838,15 @@ fn HomePage() -> impl IntoView {
     let (registred_machines, set_registred_machines) = signal::<Vec<Machine>>(vec![]);
     let (status_machine, set_status_machine) = signal::<HashMap<String, bool>>(HashMap::new());
 
+    // Drives the periodic re-check below. Bumping it is what makes a machine
+    // that comes up a few minutes after a wake show as online without the
+    // user having to reload the page.
+    let (status_tick, set_status_tick) = signal(0u32);
+    set_interval(
+        move || set_status_tick.update(|tick| *tick = tick.wrapping_add(1)),
+        std::time::Duration::from_secs(STATUS_REFRESH_SECS),
+    );
+
     // Load initial registred machines
     Effect::new(move || {
         leptos::task::spawn_local(async move {
@@ -1841,8 +1857,10 @@ fn HomePage() -> impl IntoView {
         });
     });
 
-    // check the status of registred machines when they change
+    // check the status of registred machines when they change, and again on
+    // every refresh tick
     Effect::new(move |_| {
+        let _ = status_tick.get();
         let machines = registred_machines.get();
         if machines.is_empty() {
             // console_log("No registred machines");
@@ -1856,9 +1874,6 @@ fn HomePage() -> impl IntoView {
 
             for m in machines {
                 let machine_mac = m.mac.clone();
-                let machine_name = m.name.clone();
-
-                console_log(&format!("Checking machine {}", machine_name));
                 let future = async move { (machine_mac, is_machine_online(&m.mac).await) };
                 futures.push(future);
             }
