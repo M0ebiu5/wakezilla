@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -30,61 +30,45 @@ struct ConnectionActivity {
     limiter: TurnOffLimiter,
     ip: Ipv4Addr,
     min_bytes: u64,
+    /// Bytes moved since this connection last refreshed the idle timer.
     bytes: AtomicU64,
-    counted: AtomicBool,
 }
 
 impl ConnectionActivity {
     /// Begin tracking a freshly accepted connection.
     ///
-    /// A `min_bytes` of 0 restores the old behaviour: the connection is
-    /// registered immediately, before the caller yields, so the inactivity
-    /// monitor cannot tick in between.
+    /// A `min_bytes` of 0 restores the old behaviour: accepting the connection
+    /// refreshes the idle timer immediately, as does any later traffic.
     fn start(limiter: TurnOffLimiter, ip: Ipv4Addr, min_bytes: u64) -> Arc<Self> {
-        let activity = Arc::new(Self {
+        if min_bytes == 0 {
+            limiter.update_last_request(ip);
+        }
+        Arc::new(Self {
             limiter,
             ip,
             min_bytes,
             bytes: AtomicU64::new(0),
-            counted: AtomicBool::new(false),
-        });
-        if min_bytes == 0 {
-            activity.mark_active();
-        }
-        activity
+        })
     }
 
-    /// Record `n` bytes moved in either direction.
+    /// Record `n` bytes moved in either direction. Every `min_bytes` moved
+    /// refreshes the idle timer once.
+    ///
+    /// Merely being open is not activity: a long-lived connection such as a
+    /// web app's websocket trickles keep-alive pings for as long as a tab stays
+    /// open, and must not keep the machine awake by existing.
     fn record(&self, n: usize) {
-        if n == 0 || self.counted.load(Ordering::Relaxed) {
+        if n == 0 {
             return;
         }
         let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         if total >= self.min_bytes {
-            self.mark_active();
-        }
-    }
-
-    /// Promote this connection to a real request. Only the first call has an
-    /// effect, so the active-connection count stays balanced.
-    fn mark_active(&self) {
-        if self.counted.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        debug!(
-            "Connection to {} carried {} bytes, counting it as activity",
-            self.ip,
-            self.bytes.load(Ordering::Relaxed)
-        );
-        self.limiter.update_last_request(self.ip);
-        self.limiter.connection_started(self.ip);
-    }
-
-    /// Release the connection. Connections that never carried enough data were
-    /// never registered, so they leave the idle timer untouched.
-    fn finish(&self) {
-        if self.counted.load(Ordering::SeqCst) {
-            self.limiter.connection_ended(self.ip);
+            self.bytes.fetch_sub(total, Ordering::Relaxed);
+            debug!(
+                "Connection to {} carried {} bytes, counting it as activity",
+                self.ip, total
+            );
+            self.limiter.update_last_request(self.ip);
         }
     }
 }
@@ -157,7 +141,6 @@ struct MachineConfig {
 pub struct TurnOffLimiter {
     machines: Arc<Mutex<HashMap<Ipv4Addr, MachineConfig>>>,
     offline_since: Arc<Mutex<HashMap<String, std::time::Instant>>>,
-    active_connections: Arc<Mutex<HashMap<Ipv4Addr, u32>>>,
 }
 
 impl Default for TurnOffLimiter {
@@ -171,7 +154,6 @@ impl TurnOffLimiter {
         Self {
             machines: Arc::new(Mutex::new(HashMap::new())),
             offline_since: Arc::new(Mutex::new(HashMap::new())),
-            active_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -214,12 +196,6 @@ impl TurnOffLimiter {
     }
 
     pub fn idle_minutes(&self, ip: Ipv4Addr) -> Option<u64> {
-        {
-            let active = self.active_connections.lock().unwrap();
-            if active.get(&ip).copied().unwrap_or(0) > 0 {
-                return Some(0);
-            }
-        }
         let machines = self.machines.lock().unwrap();
         machines.get(&ip).map(|config| {
             let elapsed = Instant::now().duration_since(config.last_request);
@@ -252,7 +228,6 @@ impl TurnOffLimiter {
                 );
             }
         }
-        self.active_connections.lock().unwrap().remove(&ip);
     }
 
     pub fn update_last_request(&self, ip: Ipv4Addr) {
@@ -265,34 +240,6 @@ impl TurnOffLimiter {
                 config.mac, ip
             );
         }
-    }
-
-    pub fn connection_started(&self, ip: Ipv4Addr) {
-        let mut map = self.active_connections.lock().unwrap();
-        *map.entry(ip).or_insert(0) += 1;
-    }
-
-    pub fn connection_ended(&self, ip: Ipv4Addr) {
-        {
-            let mut map = self.active_connections.lock().unwrap();
-            if let Some(count) = map.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    map.remove(&ip);
-                }
-            }
-        }
-        self.update_last_request(ip);
-    }
-
-    #[cfg(test)]
-    fn active_connection_count(&self, ip: Ipv4Addr) -> u32 {
-        self.active_connections
-            .lock()
-            .unwrap()
-            .get(&ip)
-            .copied()
-            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -320,8 +267,6 @@ impl TurnOffLimiter {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let active_snapshot: HashMap<Ipv4Addr, u32> =
-                    limiter.active_connections.lock().unwrap().clone();
                 let machines_to_check: Vec<(Ipv4Addr, u16, String)> = {
                     let machines = limiter.machines.lock().unwrap();
                     machines
@@ -332,9 +277,6 @@ impl TurnOffLimiter {
                                 "Checking inactivity for machine {} (IP: {}): last request was {:?} ago, window is {:?}",
                                 config.mac, ip, time_since_last_request, config.window
                             );
-                            if active_snapshot.get(ip).copied().unwrap_or(0) > 0 {
-                                return None;
-                            }
                             if time_since_last_request > config.window {
                                 if config.can_be_turned_off {
                                     let should_trigger = {
@@ -467,9 +409,9 @@ impl TurnOffLimiter {
                     let config_clone = Arc::clone(&config);
 
                     // Accepting a connection is not activity on its own. The
-                    // connection starts unregistered and only refreshes the
-                    // idle timer once it has actually carried data, which the
-                    // CountingStream below reports as bytes are proxied.
+                    // connection refreshes the idle timer each time it carries
+                    // another `activity_min_bytes`, which the CountingStream
+                    // below reports as bytes are proxied.
                     let activity = ConnectionActivity::start(
                         rate_limiter.clone(),
                         machine_ip_clone,
@@ -578,8 +520,6 @@ impl TurnOffLimiter {
                                 }
                             }
                         }
-
-                        activity.finish();
                     });
                 }
             }
@@ -666,37 +606,45 @@ mod tests {
 
         activity.record(100);
         activity.record(200);
-
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
 
-        // Closing a connection that never carried data must not reset the timer
-        // either, otherwise a poller still keeps the machine awake.
-        activity.finish();
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        // Closing it must not reset the timer either, otherwise a poller
+        // still keeps the machine awake.
+        drop(activity);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
     }
 
     #[test]
-    fn connection_at_threshold_counts_as_activity() {
+    fn open_connection_with_keepalive_pings_is_not_activity() {
+        let limiter = tracked_limiter();
+        let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+
+        // A websocket held open by an idle browser tab: ~15-byte pings.
+        for _ in 0..100 {
+            activity.record(15);
+        }
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+        assert_eq!(limiter.idle_minutes(TEST_IP), Some(10));
+    }
+
+    #[test]
+    fn every_threshold_of_bytes_refreshes_idle_timer() {
         let limiter = tracked_limiter();
         let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 4096);
         limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
 
         activity.record(4000);
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
-
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
         activity.record(96);
-        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
 
-        // Further bytes must not double-register the same connection.
-        activity.record(1_000_000);
-        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
-
+        // The counter restarts, so the same connection has to carry another
+        // full threshold before it refreshes the timer again.
         limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
-        activity.finish();
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        activity.record(4000);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
+        activity.record(96);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
     }
 
@@ -706,11 +654,11 @@ mod tests {
         limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
 
         let activity = ConnectionActivity::start(limiter.clone(), TEST_IP, 0);
-
-        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
-        activity.finish();
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+
+        limiter.backdate_last_request(TEST_IP, Duration::from_secs(600));
+        activity.record(1);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
     }
 
     #[tokio::test]
@@ -727,11 +675,10 @@ mod tests {
         let mut buf = [0u8; 4];
         counted.read_exact(&mut buf).await.expect("read failed");
         assert_eq!(&buf, b"abcd");
-        assert_eq!(limiter.active_connection_count(TEST_IP), 0);
+        assert!(limiter.secs_since_last_request(TEST_IP).unwrap() >= 600);
 
         // 4 more bytes client -> machine crosses it.
         counted.write_all(b"efgh").await.expect("write failed");
-        assert_eq!(limiter.active_connection_count(TEST_IP), 1);
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
     }
 

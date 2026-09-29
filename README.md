@@ -159,8 +159,10 @@ Each machine can be configured with:
    - A machine's `last_request` timestamp is updated by proxied connections that actually carry traffic
    - Merely accepting a connection does **not** count: an uptime check or dashboard that opens a socket
      every minute would otherwise hold the idle timer at zero and the machine would never suspend.
-     A connection counts once it has transferred `health.activity_min_bytes` (default 4096) in either
-     direction; set that to `0` to count every accepted connection, as older versions did
+     A connection refreshes the timer each time it transfers another `health.activity_min_bytes`
+     (default 4096) in either direction, so a connection that is merely held open (e.g. an idle
+     browser tab's websocket) does not keep the machine awake; set that to `0` to count every
+     accepted connection, as older versions did
    - The monitor compares the time since `last_request` against the configured `inactivity_period` (in minutes)
    - If no requests are received within the inactivity period, a shutdown signal is sent via HTTP to the client
    - When a machine configuration is updated (e.g., inactivity period changed), the monitor is automatically stopped and restarted with the new settings
