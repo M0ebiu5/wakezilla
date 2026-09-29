@@ -412,6 +412,7 @@ fn MachineDetailPage() -> impl IntoView {
                                                 name: None,
                                                 local_port: 0,
                                                 target_port: 0,
+                                                no_wake_paths: vec![],
                                             });
                                         });
                                 }
@@ -562,6 +563,40 @@ fn MachineDetailPage() -> impl IntoView {
                                                             }
                                                         />
                                                     </div>
+                                                </div>
+                                                <div class="field">
+                                                    <label for=format!("pf-no-wake-{}", idx + 1)>"Paths that don't wake the machine"</label>
+                                                    <input
+                                                        class="input"
+                                                        id=format!("pf-no-wake-{}", idx + 1)
+                                                        placeholder="/_app/version.json, /ws/*"
+                                                        prop:value=move || {
+                                                            port_forwards
+                                                                .get()
+                                                                .get(idx)
+                                                                .map(|pf| pf.no_wake_paths.join(", "))
+                                                                .unwrap_or_default()
+                                                        }
+                                                        on:change=move |ev| {
+                                                            let target = ev.target().unwrap();
+                                                            let input: HtmlInputElement = target.dyn_into().unwrap();
+                                                            let paths: Vec<String> = input
+                                                                .value()
+                                                                .split(',')
+                                                                .map(|p| p.trim().to_string())
+                                                                .filter(|p| !p.is_empty())
+                                                                .collect();
+                                                            set_port_forwards
+                                                                .update(|pfs| {
+                                                                    if let Some(pf) = pfs.get_mut(idx) {
+                                                                        pf.no_wake_paths = paths;
+                                                                    }
+                                                                });
+                                                        }
+                                                    />
+                                                    <p class="field-help">
+                                                        "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
+                                                    </p>
                                                 </div>
                                             </div>
                                         }
@@ -781,6 +816,7 @@ fn Header(
                 name: None,
                 local_port: 0,
                 target_port: 0,
+                no_wake_paths: vec![],
             }],
             idle_minutes: None,
             offline_minutes: None,
@@ -1591,6 +1627,7 @@ fn AddMachine(
                                             name: None,
                                             local_port: 0,
                                             target_port: 0,
+                                            no_wake_paths: vec![],
                                         });
                                     });
                             }
@@ -1734,6 +1771,40 @@ fn AddMachine(
                                                     />
                                                 </div>
                                             </div>
+                                            <div class="field">
+                                                <label for=format!("pf-no-wake-{}", idx + 1)>"Paths that don't wake the machine"</label>
+                                                <input
+                                                    class="input"
+                                                    id=format!("pf-no-wake-{}", idx + 1)
+                                                    placeholder="/_app/version.json, /ws/*"
+                                                    prop:value=move || {
+                                                        port_forwards
+                                                            .get()
+                                                            .get(idx)
+                                                            .map(|pf| pf.no_wake_paths.join(", "))
+                                                            .unwrap_or_default()
+                                                    }
+                                                    on:change=move |ev| {
+                                                        let target = ev.target().unwrap();
+                                                        let input: HtmlInputElement = target.dyn_into().unwrap();
+                                                        let paths: Vec<String> = input
+                                                            .value()
+                                                            .split(',')
+                                                            .map(|p| p.trim().to_string())
+                                                            .filter(|p| !p.is_empty())
+                                                            .collect();
+                                                        set_port_forwards
+                                                            .update(|pfs| {
+                                                                if let Some(pf) = pfs.get_mut(idx) {
+                                                                    pf.no_wake_paths = paths;
+                                                                }
+                                                            });
+                                                    }
+                                                />
+                                                <p class="field-help">
+                                                    "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
+                                                </p>
+                                            </div>
                                         </div>
                                     }
                                 }
@@ -1829,6 +1900,7 @@ fn HomePage() -> impl IntoView {
             name: None,
             local_port: 0,
             target_port: 0,
+            no_wake_paths: vec![],
         }],
         idle_minutes: None,
         offline_minutes: None,

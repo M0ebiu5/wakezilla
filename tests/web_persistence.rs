@@ -38,6 +38,7 @@ fn save_and_load_machines_round_trip() {
             name: "SSH".into(),
             local_port: 2222,
             target_port: 22,
+            no_wake_paths: vec![],
         }],
     }];
 

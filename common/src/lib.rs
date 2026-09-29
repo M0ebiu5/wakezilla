@@ -5,6 +5,10 @@ pub struct PortForward {
     pub name: Option<String>,
     pub local_port: u16,
     pub target_port: u16,
+    /// HTTP paths that never wake a sleeping machine, e.g. a web app's
+    /// background polling. A trailing `*` matches a path prefix.
+    #[serde(default)]
+    pub no_wake_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

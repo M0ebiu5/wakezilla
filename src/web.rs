@@ -84,6 +84,8 @@ pub struct PortForward {
     pub name: String,
     pub local_port: u16,
     pub target_port: u16,
+    #[serde(default)]
+    pub no_wake_paths: Vec<String>,
 }
 
 pub fn validate_ip(ip: &str) -> Result<(), ValidationError> {
@@ -122,6 +124,7 @@ pub fn api_port_forward_to_internal(pf: &wakezilla_common::PortForward) -> PortF
         name: pf.name.clone().unwrap_or_default(),
         local_port: pf.local_port,
         target_port: pf.target_port,
+        no_wake_paths: pf.no_wake_paths.clone(),
     }
 }
 
@@ -134,6 +137,7 @@ pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortF
         },
         local_port: pf.local_port,
         target_port: pf.target_port,
+        no_wake_paths: pf.no_wake_paths.clone(),
     }
 }
 

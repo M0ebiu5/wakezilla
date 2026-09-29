@@ -6,6 +6,7 @@ fn api_port_forward_allows_missing_name() {
         name: None,
         local_port: 2222,
         target_port: 22,
+        no_wake_paths: vec![],
     };
 
     let internal = api_port_forward_to_internal(&pf);

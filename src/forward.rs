@@ -8,13 +8,64 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 fn turn_off_url(remote_ip: &str, turn_off_port: u16) -> String {
     format!("http://{}:{}/machines/turn-off", remote_ip, turn_off_port)
+}
+
+/// Returns the path of an HTTP request line (`GET /path?query HTTP/1.1`),
+/// without query string or fragment. `None` if `line` isn't an HTTP request line.
+fn http_request_path(line: &[u8]) -> Option<&str> {
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.split(' ');
+    parts.next().filter(|method| !method.is_empty())?;
+    let target = parts.next().filter(|t| t.starts_with('/'))?;
+    parts.next().filter(|v| v.starts_with("HTTP/"))?;
+    target.split(['?', '#']).next()
+}
+
+fn path_matches(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| match pattern.strip_suffix('*') {
+        Some(prefix) => path.starts_with(prefix),
+        None => path == pattern,
+    })
+}
+
+/// Peeks (without consuming) the first HTTP request line on `stream` and
+/// returns its path if it matches `no_wake_paths`. Non-HTTP traffic never
+/// matches, so it still wakes the machine.
+async fn no_wake_request_path(stream: &TcpStream, no_wake_paths: &[String]) -> Option<String> {
+    if no_wake_paths.is_empty() {
+        return None;
+    }
+    let mut buf = [0u8; 2048];
+    let peek_request_line = async {
+        loop {
+            let n = stream.peek(&mut buf).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            if let Some(end) = buf[..n].windows(2).position(|w| w == b"\r\n") {
+                return http_request_path(&buf[..end])
+                    .filter(|path| path_matches(path, no_wake_paths))
+                    .map(str::to_string);
+            }
+            if n == buf.len() {
+                return None;
+            }
+            // Partial request line; peek returns immediately while data is
+            // buffered, so back off briefly before looking again.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), peek_request_line)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Tracks how much data has actually flowed through a single proxied
@@ -406,6 +457,13 @@ impl TurnOffLimiter {
         );
 
         let machine_ip = machine.ip;
+        let no_wake_paths: Arc<[String]> = machine
+            .port_forwards
+            .iter()
+            .find(|pf| pf.local_port == local_port)
+            .map(|pf| pf.no_wake_paths.clone())
+            .unwrap_or_default()
+            .into();
 
         // Note: Monitor is started globally, not per proxy
 
@@ -430,6 +488,7 @@ impl TurnOffLimiter {
                     let rate_limiter = self.clone();
                     let machine_ip_clone = machine_ip;
                     let config_clone = Arc::clone(&config);
+                    let no_wake_paths = Arc::clone(&no_wake_paths);
 
                     // Accepting a connection is not activity on its own. The
                     // connection refreshes the idle timer each time it carries
@@ -445,6 +504,17 @@ impl TurnOffLimiter {
                         'conn: {
                             let connect_timeout = Duration::from_millis(1000);
                             if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
+                                // Background requests (e.g. a web app polling
+                                // for updates) must not wake a sleeping machine.
+                                if let Some(path) =
+                                    no_wake_request_path(&inbound, &no_wake_paths).await
+                                {
+                                    debug!(
+                                        "Host {} is down; not waking it for {} from {}",
+                                        remote_addr_clone, path, client_addr
+                                    );
+                                    break 'conn;
+                                }
                                 info!(
                                     "Host {} seems to be down. Sending WOL packet to MAC {}.",
                                     remote_addr_clone, mac_str_clone
@@ -733,6 +803,59 @@ mod tests {
         // 4 more bytes client -> machine crosses it.
         counted.write_all(b"efgh").await.expect("write failed");
         assert!(limiter.secs_since_last_request(TEST_IP).unwrap() < 5);
+    }
+
+    #[test]
+    fn http_request_path_strips_query_and_rejects_non_http() {
+        assert_eq!(
+            http_request_path(b"GET /_app/version.json?t=1 HTTP/1.1"),
+            Some("/_app/version.json")
+        );
+        assert_eq!(http_request_path(b"POST /api/chat HTTP/1.1"), Some("/api/chat"));
+        assert_eq!(http_request_path(b"SSH-2.0-OpenSSH_9.6"), None);
+        assert_eq!(http_request_path(b"GET /path"), None);
+    }
+
+    #[test]
+    fn path_matches_supports_exact_and_prefix_patterns() {
+        let patterns = vec!["/_app/version.json".to_string(), "/ws/*".to_string()];
+        assert!(path_matches("/_app/version.json", &patterns));
+        assert!(path_matches("/ws/socket.io/", &patterns));
+        assert!(!path_matches("/_app/version.json.bak", &patterns));
+        assert!(!path_matches("/api/chats", &patterns));
+        assert!(!path_matches("/anything", &[]));
+    }
+
+    async fn no_wake_path_after_sending(request: &[u8]) -> Option<(Option<String>, Vec<u8>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = listener.local_addr().ok()?;
+        let mut client = TcpStream::connect(addr).await.ok()?;
+        let (mut server, _) = listener.accept().await.ok()?;
+        client.write_all(request).await.ok()?;
+
+        let patterns = vec!["/_app/version.json".to_string()];
+        let matched = no_wake_request_path(&server, &patterns).await;
+
+        // Peeking must leave the request intact for the upstream server.
+        let mut received = vec![0u8; request.len()];
+        server.read_exact(&mut received).await.ok()?;
+        Some((matched, received))
+    }
+
+    #[tokio::test]
+    async fn no_wake_request_path_peeks_without_consuming() {
+        let poll = b"GET /_app/version.json HTTP/1.1\r\nHost: big:3002\r\n\r\n";
+        let Some((matched, received)) = no_wake_path_after_sending(poll).await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        assert_eq!(matched.as_deref(), Some("/_app/version.json"));
+        assert_eq!(received, poll);
+
+        let real = b"GET /api/v1/chats HTTP/1.1\r\nHost: big:3002\r\n\r\n";
+        let (matched, received) = no_wake_path_after_sending(real).await.unwrap();
+        assert_eq!(matched, None);
+        assert_eq!(received, real);
     }
 
     #[test]
