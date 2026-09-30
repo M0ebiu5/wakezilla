@@ -183,7 +183,9 @@ Each port forward can have two shell scripts that the machine's client server ru
 - **Script when idle** runs when the machine's inactivity period ends. The machine is turned off
   once the script exits, so its run time is the grace period (e.g. `sleep 60`, or wait for a job
   to finish); activity while it runs cancels the turn-off. On machines that can't be turned off,
-  the script still runs, once per idle period.
+  the script still runs. While the machine stays idle, it runs again after every further
+  inactivity period, so a script can decline to act (e.g. while a download is running) and
+  try again later.
 
 Scripts get `WAKEZILLA_EVENT` (`connect` or `idle`), `WAKEZILLA_LOCAL_PORT` and
 `WAKEZILLA_TARGET_PORT` in their environment and are killed after

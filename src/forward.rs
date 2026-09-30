@@ -166,6 +166,25 @@ impl ConnectScriptGate {
     }
 }
 
+/// Whether a connection can go ahead without waking the machine: the
+/// forwarded port answers or, for a forward with a connect script, the
+/// machine's client server does. The connect script may be what starts the
+/// service behind a closed port, so a closed port alone doesn't mean the
+/// machine is asleep.
+async fn forward_reachable(
+    remote_addr: SocketAddr,
+    client_server: Option<SocketAddr>,
+    timeout: Duration,
+) -> bool {
+    if wol::tcp_check(remote_addr, timeout).await {
+        return true;
+    }
+    match client_server {
+        Some(addr) => wol::tcp_check(addr, timeout).await,
+        None => false,
+    }
+}
+
 /// Returns the path of an HTTP request line (`GET /path?query HTTP/1.1`),
 /// without query string or fragment. `None` if `line` isn't an HTTP request line.
 fn http_request_path(line: &[u8]) -> Option<&str> {
@@ -537,11 +556,12 @@ impl TurnOffLimiter {
                             }
                             let should_trigger = {
                                 let mut last_attempt = config.last_turn_off_attempt.lock().unwrap();
-                                // A turn-off is retried every window while the
-                                // machine stays idle; idle scripts alone run
-                                // once per idle period.
+                                // Retried every window while the machine stays
+                                // idle: the turn-off may have failed, and an idle
+                                // script may have decided not to act yet (e.g. a
+                                // download still running).
                                 let can_attempt = last_attempt
-                                    .map(|t| config.can_be_turned_off && now.duration_since(t) > config.window)
+                                    .map(|t| now.duration_since(t) > config.window)
                                     .unwrap_or(true);
                                 if can_attempt {
                                     *last_attempt = Some(now);
@@ -683,6 +703,9 @@ impl TurnOffLimiter {
             .and_then(ForwardScript::connect)
             .map(|script| Arc::new(ConnectScriptGate::new(script)));
         let client_port = machine.turn_off_port.unwrap_or(config.server.client_port);
+        let client_server = connect_script
+            .as_ref()
+            .map(|_| SocketAddr::new(machine_ip.into(), client_port));
 
         // Note: Monitor is started globally, not per proxy
 
@@ -727,7 +750,7 @@ impl TurnOffLimiter {
                             // Whether the request was already found not to be
                             // a background (no_wake_paths) request.
                             let mut checked_background = false;
-                            if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
+                            if !forward_reachable(remote_addr_clone, client_server, connect_timeout).await {
                                 // Background requests (e.g. a web app polling
                                 // for updates) must not wake a sleeping machine.
                                 if let Some(path) =
@@ -775,7 +798,7 @@ impl TurnOffLimiter {
                                 let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                                 let mut host_up = false;
                                 while tokio::time::Instant::now() < deadline {
-                                    if wol::tcp_check(remote_addr_clone, connect_timeout).await {
+                                    if forward_reachable(remote_addr_clone, client_server, connect_timeout).await {
                                         info!("Host {} is now up.", remote_addr_clone);
                                         host_up = true;
                                         break;
@@ -1372,5 +1395,57 @@ mod tests {
         assert!(hits.lock().unwrap().is_empty());
         request("/c/some-chat").await;
         assert_eq!(*hits.lock().unwrap(), vec!["connect:gpu-switch webui"]);
+    }
+
+    #[tokio::test]
+    async fn connect_script_runs_when_only_the_forwarded_port_is_closed() {
+        let Some((client_port, hits)) = fake_client_server().await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        // Nothing listens on the forwarded port: the service is stopped, but
+        // the machine (its client server) is up.
+        let closed_port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let local_port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut machine = test_machine();
+        machine.ip = Ipv4Addr::LOCALHOST;
+        machine.turn_off_port = Some(client_port);
+        machine.port_forwards = vec![crate::web::PortForward {
+            name: "qbittorrent".into(),
+            local_port,
+            target_port: closed_port,
+            no_wake_paths: vec![],
+            on_connect_script: Some("start-qbittorrent".into()),
+            on_idle_script: None,
+        }];
+        let limiter = TurnOffLimiter::new();
+        let (_tx, rx) = watch::channel(true);
+        let remote_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, closed_port));
+        tokio::spawn(async move {
+            limiter
+                .proxy_internal(local_port, remote_addr, machine, rx, Arc::default())
+                .await
+        });
+
+        let _conn = loop {
+            match TcpStream::connect(("127.0.0.1", local_port)).await {
+                Ok(conn) => break conn,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        // Without the client server check this would send WOL and wait 60s.
+        for _ in 0..50 {
+            if !hits.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(*hits.lock().unwrap(), vec!["connect:start-qbittorrent"]);
     }
 }
