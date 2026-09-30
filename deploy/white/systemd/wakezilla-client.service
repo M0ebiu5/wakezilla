@@ -1,0 +1,17 @@
+[Unit]
+Description=Wakezilla - client server (remote turn-off endpoint)
+Documentation=https://github.com/guibeira/wakezilla
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/wakezilla client-server --port 3001
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

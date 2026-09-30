@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# gpu-switch: hand White's GPU to one app, stopping everything else that uses it.
+#
+#   gpu-switch comfy [--dry-run]   ComfyUI (container comfy-comfyui-1, port 8188)
+#   gpu-switch webui [--dry-run]   vLLM behind Open WebUI (container qwen38-single-1)
+#
+# Run by the wakezilla client as the connect script of the ComfyUI and Open WebUI
+# port forwards. Returns immediately when the GPU already belongs to the app.
+set -euo pipefail
+
+COMFY_DIR=/home/m00n/projects/comfy
+COMFY_URL=http://127.0.0.1:8188/
+COMFY_READY_WAIT=120   # seconds to wait for ComfyUI to answer after starting it
+
+target=${1:-}
+dry_run=false
+[[ ${2:-} == --dry-run ]] && dry_run=true
+
+case $target in
+  comfy) keep=comfy-comfyui-1 ;;
+  webui) keep=qwen38-single-1 ;;
+  *) echo "usage: gpu-switch comfy|webui [--dry-run]" >&2; exit 2 ;;
+esac
+
+run() {
+  if $dry_run; then echo "would run: $*"; else echo "+ $*"; "$@"; fi
+}
+
+# Two connections to different forwards must not switch at the same time.
+exec 9>/run/lock/gpu-switch.lock
+flock 9
+
+# Running containers that reserve the GPU.
+gpu_containers() {
+  docker ps -q | xargs -r docker inspect \
+    -f '{{.Name}} {{.HostConfig.Runtime}} {{json .HostConfig.DeviceRequests}}' |
+    awk '/nvidia|"gpu"/ { sub("^/", "", $1); print $1 }'
+}
+
+# PIDs of GPU compute processes that don't belong to the kept container.
+stray_gpu_pids() {
+  local keep_id
+  keep_id=$(docker inspect -f '{{.Id}}' "$keep" 2>/dev/null || true)
+  nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null |
+    while read -r pid; do
+      [[ -n $pid && -r /proc/$pid/cgroup ]] || continue
+      if [[ -n $keep_id ]] && grep -q "$keep_id" "/proc/$pid/cgroup"; then continue; fi
+      echo "$pid"
+    done
+}
+
+running() { [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
+
+others=$(gpu_containers | grep -vx "$keep" || true)
+
+# Fast path: the GPU already belongs to the app.
+if running "$keep" && [[ -z $others ]] && [[ -z $(stray_gpu_pids) ]]; then
+  if [[ $target == comfy ]] || running open-webui; then
+    echo "GPU already belongs to $target"
+    exit 0
+  fi
+fi
+
+echo "Switching GPU to $target"
+for c in $others; do
+  if [[ $c == qwen38-single-1 ]]; then
+    run systemctl stop qwen38-single   # keeps the systemd unit's state accurate
+  else
+    run docker stop "$c"
+  fi
+done
+
+pids=$(stray_gpu_pids)
+if [[ -n $pids ]]; then
+  echo "Stopping other GPU processes: $(echo $pids)"
+  if ! $dry_run; then
+    kill -TERM $pids 2>/dev/null || true
+    for _ in $(seq 20); do
+      [[ -z $(stray_gpu_pids) ]] && break
+      sleep 0.5
+    done
+    pids=$(stray_gpu_pids)
+    [[ -n $pids ]] && kill -KILL $pids 2>/dev/null || true
+  fi
+fi
+
+case $target in
+  comfy)
+    running "$keep" || run docker compose --project-directory "$COMFY_DIR" up -d --no-build
+    $dry_run && exit 0
+    # The connection is forwarded once this script exits, so wait for ComfyUI.
+    for _ in $(seq "$COMFY_READY_WAIT"); do
+      if curl -sf -o /dev/null "$COMFY_URL"; then echo "ComfyUI is up"; exit 0; fi
+      sleep 1
+    done
+    echo "ComfyUI did not answer within ${COMFY_READY_WAIT}s" >&2
+    exit 1
+    ;;
+  webui)
+    # Open WebUI answers at once; the model loads in the background (minutes).
+    running open-webui || run docker start open-webui
+    running "$keep" || run systemctl restart qwen38-single
+    ;;
+esac

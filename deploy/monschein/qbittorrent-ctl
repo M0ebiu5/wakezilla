@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# qbittorrent-ctl: start/stop the qBittorrent container for wakezilla.
+#
+#   qbittorrent-ctl start   start the container if it isn't running; wait for the WebUI
+#   qbittorrent-ctl idle    stop the container unless a torrent is downloading
+#
+# Run by the wakezilla client on this server as the connect and idle scripts of
+# the qBittorrent port forward. The API is queried from inside the container,
+# where qBittorrent's localhost auth bypass (WebUI\LocalHostAuth=false) applies.
+set -euo pipefail
+
+COMPOSE_DIR=/home/m00n/projects/qbittorrent
+CONTAINER=qbittorrent
+READY_WAIT=90   # seconds to wait for the WebUI after starting
+
+running() { [[ $(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null) == true ]]; }
+
+api() { docker exec "$CONTAINER" curl -sf -m 10 "http://127.0.0.1:8080/api/v2/$1"; }
+
+case ${1:-} in
+  start)
+    if running; then
+      exit 0
+    fi
+    echo "Starting $CONTAINER"
+    docker compose --project-directory "$COMPOSE_DIR" up -d "$CONTAINER"
+    # The connection is forwarded once this script exits, so wait for the WebUI.
+    for _ in $(seq "$READY_WAIT"); do
+      if api app/version >/dev/null 2>&1; then
+        echo "$CONTAINER is up"
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "$CONTAINER WebUI did not answer within ${READY_WAIT}s" >&2
+    exit 1
+    ;;
+  idle)
+    if ! running; then
+      echo "$CONTAINER is not running"
+      exit 0
+    fi
+    # Unfinished torrents that are downloading or about to (stalled, queued,
+    # checking, fetching metadata) keep the container running; stopped and
+    # errored ones don't.
+    if ! torrents=$(api torrents/info); then
+      echo "Could not query $CONTAINER; leaving it running" >&2
+      exit 1
+    fi
+    downloading=$(python3 -c '
+import json, sys
+active = {"downloading", "forcedDL", "metaDL", "forcedMetaDL", "stalledDL",
+          "queuedDL", "checkingDL", "allocating"}
+names = [t["name"] for t in json.load(sys.stdin) if t["state"] in active]
+print("\n".join(names))
+' <<<"$torrents")
+    if [[ -n $downloading ]]; then
+      echo "Downloads in progress, leaving $CONTAINER running:"
+      echo "$downloading"
+      exit 0
+    fi
+    echo "No downloads in progress, stopping $CONTAINER"
+    # compose honours stop_grace_period (60s) so qBittorrent can save resume data.
+    docker compose --project-directory "$COMPOSE_DIR" stop "$CONTAINER"
+    ;;
+  *)
+    echo "usage: qbittorrent-ctl start|idle" >&2
+    exit 2
+    ;;
+esac

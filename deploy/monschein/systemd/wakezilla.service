@@ -1,0 +1,23 @@
+[Unit]
+Description=Wakezilla - Wake-on-LAN proxy server
+Documentation=https://github.com/guibeira/wakezilla
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wakezilla
+Environment=WAKEZILLA__STORAGE__MACHINES_DB_PATH=/opt/wakezilla/machines.json
+ExecStart=/usr/local/bin/wakezilla proxy-server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# WOL needs raw socket access
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

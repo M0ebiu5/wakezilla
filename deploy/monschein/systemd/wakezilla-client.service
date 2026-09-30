@@ -1,0 +1,17 @@
+[Unit]
+Description=Wakezilla - client server (runs port-forward scripts on this machine)
+Documentation=https://github.com/guibeira/wakezilla
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/wakezilla client-server --port 3001 --allow-scripts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
