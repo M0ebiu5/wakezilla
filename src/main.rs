@@ -57,6 +57,11 @@ pub struct ClientServerArgs {
         help_heading = "Client Server Options"
     )]
     port: u16,
+
+    /// Run port-forward scripts sent by the proxy server. Anyone who can
+    /// reach the client port can then run shell commands on this machine.
+    #[arg(long, help_heading = "Client Server Options")]
+    allow_scripts: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -135,8 +140,9 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::ClientServer(_args) => {
-            if let Err(e) = client_server::start(config.server.client_port).await {
+        Commands::ClientServer(args) => {
+            let allow_scripts = args.allow_scripts || config.server.allow_scripts;
+            if let Err(e) = client_server::start(config.server.client_port, allow_scripts).await {
                 error!("Client server error: {}", e);
                 std::process::exit(1);
             }

@@ -145,6 +145,7 @@ Each machine can be configured with:
 - Port Forwards:
   - Local Port: Port on the server
   - Target Port: Port on the remote machine
+  - Script on new connection / Script when idle (optional, see [Port-forward scripts](#port-forward-scripts))
 
 ## How It Works
 
@@ -168,11 +169,36 @@ Each machine can be configured with:
    - When a machine configuration is updated (e.g., inactivity period changed), the monitor is automatically stopped and restarted with the new settings
    - This ensures only one monitor instance runs at a time, preventing duplicate shutdown signals
 
+### Port-forward scripts
+
+Each port forward can have two shell scripts that the machine's client server runs
+(`sh -c` on Linux/macOS, `cmd /C` on Windows):
+
+- **Script on new connection** runs for each new connection, after the machine is awake
+  (and woken if needed) and before the connection is forwarded. The connection waits for it,
+  so it can e.g. start the service behind the port. Connections arriving while it runs share
+  the next run instead of starting one each. Requests dropped by "Paths that don't wake the
+  machine" don't run it.
+- **Script when idle** runs when the machine's inactivity period ends. The machine is turned off
+  once the script exits, so its run time is the grace period (e.g. `sleep 60`, or wait for a job
+  to finish); activity while it runs cancels the turn-off. On machines that can't be turned off,
+  the script still runs, once per idle period.
+
+Scripts get `WAKEZILLA_EVENT` (`connect` or `idle`), `WAKEZILLA_LOCAL_PORT` and
+`WAKEZILLA_TARGET_PORT` in their environment and are killed after
+`server.script_timeout_secs` (default 120). Failures are logged and never block
+forwarding or the turn-off.
+
+Running scripts is **off by default**. Start the client with `wakezilla client-server --allow-scripts`
+(or `WAKEZILLA__SERVER__ALLOW_SCRIPTS=true`), otherwise it answers 403.
+
 ## Security Considerations
 
 - The server should be run on a trusted network
 - Access to the web interface should be restricted if exposed to the internet
 - The turn-off endpoint on clients should only be accessible from the server
+- With `--allow-scripts`, anyone who can reach the client port can run shell commands as the
+  client server's user; firewall that port so only the server can reach it
 
 ## Development
 ### Prerequisites

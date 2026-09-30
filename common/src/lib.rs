@@ -9,6 +9,37 @@ pub struct PortForward {
     /// background polling. A trailing `*` matches a path prefix.
     #[serde(default)]
     pub no_wake_paths: Vec<String>,
+    /// Script run on the machine (by its client server) for each new
+    /// connection, once the machine is up and before the connection is
+    /// forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_connect_script: Option<String>,
+    /// Script run on the machine (by its client server) when the idle timer
+    /// fires, before the machine is turned off. The turn-off waits a grace
+    /// period after the script and is cancelled by activity during it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_idle_script: Option<String>,
+}
+
+/// Request from the proxy asking a client server to run a port-forward script.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RunScriptRequest {
+    /// Which hook fired: `connect` or `idle`.
+    pub event: String,
+    pub script: String,
+    pub local_port: u16,
+    pub target_port: u16,
+    /// The client server kills the script after this many seconds.
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RunScriptResponse {
+    /// `None` if the script was killed (timeout or signal).
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -31,6 +31,9 @@ fn update_payload_supports_optional_fields() {
             name: Some("ssh".into()),
             local_port: 2222,
             target_port: 22,
+            no_wake_paths: vec![],
+            on_connect_script: None,
+            on_idle_script: None,
         }]),
     };
 

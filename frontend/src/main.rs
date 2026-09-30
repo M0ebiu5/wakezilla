@@ -413,6 +413,8 @@ fn MachineDetailPage() -> impl IntoView {
                                                 local_port: 0,
                                                 target_port: 0,
                                                 no_wake_paths: vec![],
+                                                on_connect_script: None,
+                                                on_idle_script: None,
                                             });
                                         });
                                 }
@@ -598,6 +600,11 @@ fn MachineDetailPage() -> impl IntoView {
                                                         "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
                                                     </p>
                                                 </div>
+                                                <PortForwardScripts
+                                                    idx=idx
+                                                    port_forwards=port_forwards
+                                                    set_port_forwards=set_port_forwards
+                                                />
                                             </div>
                                         }
                                     }
@@ -737,6 +744,63 @@ fn App() -> impl IntoView {
     }
 }
 
+/// Editors for a port forward's connect and idle scripts, which the
+/// machine's client server runs.
+#[component]
+fn PortForwardScripts(
+    idx: usize,
+    port_forwards: ReadSignal<Vec<PortForward>>,
+    set_port_forwards: WriteSignal<Vec<PortForward>>,
+) -> impl IntoView {
+    let script_value = move |get: fn(&PortForward) -> &Option<String>| {
+        move || {
+            port_forwards
+                .get()
+                .get(idx)
+                .and_then(|pf| get(pf).clone())
+                .unwrap_or_default()
+        }
+    };
+    let set_script = move |set: fn(&mut PortForward, Option<String>)| {
+        move |ev| {
+            let value = event_target_value(&ev);
+            let script = if value.trim().is_empty() { None } else { Some(value) };
+            set_port_forwards.update(|pfs| {
+                if let Some(pf) = pfs.get_mut(idx) {
+                    set(pf, script);
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="field">
+            <label for=format!("pf-connect-script-{}", idx + 1)>"Script on new connection"</label>
+            <textarea
+                id=format!("pf-connect-script-{}", idx + 1)
+                placeholder="systemctl start ollama"
+                prop:value=script_value(|pf| &pf.on_connect_script)
+                on:change=set_script(|pf, script| pf.on_connect_script = script)
+            ></textarea>
+            <p class="field-help">
+                "Runs on the machine for each new connection, once it is awake and before the connection is forwarded. Needs the client server started with --allow-scripts."
+            </p>
+        </div>
+        <div class="field">
+            <label for=format!("pf-idle-script-{}", idx + 1)>"Script when idle"</label>
+            <textarea
+                id=format!("pf-idle-script-{}", idx + 1)
+                placeholder="systemctl stop ollama"
+                prop:value=script_value(|pf| &pf.on_idle_script)
+                on:change=set_script(|pf, script| pf.on_idle_script = script)
+            ></textarea>
+            <p class="field-help">
+                "Runs on the machine when the inactivity period ends. The machine is turned off once the script exits, unless it became active while the script ran."
+            </p>
+        </div>
+    }
+}
+
 #[component]
 fn Header(
     set_machine: WriteSignal<Machine>,
@@ -817,6 +881,8 @@ fn Header(
                 local_port: 0,
                 target_port: 0,
                 no_wake_paths: vec![],
+                on_connect_script: None,
+                on_idle_script: None,
             }],
             idle_minutes: None,
             offline_minutes: None,
@@ -1628,6 +1694,8 @@ fn AddMachine(
                                             local_port: 0,
                                             target_port: 0,
                                             no_wake_paths: vec![],
+                                            on_connect_script: None,
+                                            on_idle_script: None,
                                         });
                                     });
                             }
@@ -1805,6 +1873,11 @@ fn AddMachine(
                                                     "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
                                                 </p>
                                             </div>
+                                            <PortForwardScripts
+                                                idx=idx
+                                                port_forwards=port_forwards
+                                                set_port_forwards=set_port_forwards
+                                            />
                                         </div>
                                     }
                                 }
@@ -1901,6 +1974,8 @@ fn HomePage() -> impl IntoView {
             local_port: 0,
             target_port: 0,
             no_wake_paths: vec![],
+            on_connect_script: None,
+            on_idle_script: None,
         }],
         idle_minutes: None,
         offline_minutes: None,

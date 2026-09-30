@@ -39,6 +39,8 @@ fn save_and_load_machines_round_trip() {
             local_port: 2222,
             target_port: 22,
             no_wake_paths: vec![],
+            on_connect_script: None,
+            on_idle_script: None,
         }],
     }];
 

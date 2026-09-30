@@ -63,6 +63,18 @@ pub struct ServerConfig {
     /// HTTP health check timeout in seconds (default: 5)
     #[serde(default = "default_health_timeout_secs")]
     pub health_timeout_secs: u64,
+
+    /// Let the client server run port-forward scripts sent by the proxy
+    /// (default: false). Anyone who can reach the client port can then run
+    /// commands as the client server's user, so only enable this where that
+    /// port is reachable from the proxy alone.
+    #[serde(default)]
+    pub allow_scripts: bool,
+
+    /// How long a port-forward script may run before it is killed, in
+    /// seconds (default: 120). Connections wait for their connect script.
+    #[serde(default = "default_script_timeout_secs")]
+    pub script_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -71,6 +83,8 @@ impl Default for ServerConfig {
             proxy_port: default_proxy_port(),
             client_port: default_client_port(),
             health_timeout_secs: default_health_timeout_secs(),
+            allow_scripts: false,
+            script_timeout_secs: default_script_timeout_secs(),
         }
     }
 }
@@ -217,6 +231,9 @@ fn default_client_port() -> u16 {
 }
 fn default_health_timeout_secs() -> u64 {
     5
+}
+fn default_script_timeout_secs() -> u64 {
+    120
 }
 fn default_wol_port() -> u16 {
     9

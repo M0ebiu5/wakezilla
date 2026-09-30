@@ -12,9 +12,158 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
+use wakezilla_common::{RunScriptRequest, RunScriptResponse};
 
 fn turn_off_url(remote_ip: &str, turn_off_port: u16) -> String {
     format!("http://{}:{}/machines/turn-off", remote_ip, turn_off_port)
+}
+
+fn run_script_url(remote_ip: &str, client_port: u16) -> String {
+    format!("http://{}:{}/scripts/run", remote_ip, client_port)
+}
+
+/// A port-forward script and the forward it belongs to.
+#[derive(Clone, Debug)]
+struct ForwardScript {
+    local_port: u16,
+    target_port: u16,
+    script: String,
+}
+
+impl ForwardScript {
+    fn connect(pf: &crate::web::PortForward) -> Option<Self> {
+        Self::new(pf, pf.on_connect_script.as_ref())
+    }
+
+    fn idle(pf: &crate::web::PortForward) -> Option<Self> {
+        Self::new(pf, pf.on_idle_script.as_ref())
+    }
+
+    fn new(pf: &crate::web::PortForward, script: Option<&String>) -> Option<Self> {
+        let script = script.filter(|s| !s.trim().is_empty())?;
+        Some(Self {
+            local_port: pf.local_port,
+            target_port: pf.target_port,
+            script: script.clone(),
+        })
+    }
+
+    /// Has the machine's client server run this script and logs the outcome.
+    /// Failures are logged, never fatal: a broken script must not stop the
+    /// forward from working or the machine from being turned off.
+    async fn run_on(
+        &self,
+        event: &str,
+        remote_ip: &str,
+        client_port: u16,
+        config: &Config,
+        retry_for: Duration,
+    ) {
+        let request = RunScriptRequest {
+            event: event.to_string(),
+            script: self.script.clone(),
+            local_port: self.local_port,
+            target_port: self.target_port,
+            timeout_secs: config.server.script_timeout_secs,
+        };
+        match run_remote_script(remote_ip, client_port, &request, retry_for).await {
+            Ok(response) if response.timed_out => warn!(
+                "{} script for port {} on {} timed out after {}s",
+                event, self.local_port, remote_ip, request.timeout_secs
+            ),
+            Ok(response) if response.exit_code == Some(0) => info!(
+                "{} script for port {} on {} succeeded",
+                event, self.local_port, remote_ip
+            ),
+            Ok(response) => warn!(
+                "{} script for port {} on {} exited with {:?}: {}",
+                event,
+                self.local_port,
+                remote_ip,
+                response.exit_code,
+                response.stderr.trim()
+            ),
+            Err(e) => error!(
+                "Failed to run {} script for port {} on {}:{}: {:#}",
+                event, self.local_port, remote_ip, client_port, e
+            ),
+        }
+    }
+}
+
+/// Asks the client server on `remote_ip` to run a script and waits for it to
+/// finish. Retries connection failures for `retry_for`, since a machine that
+/// just woke up may accept connections on the forwarded port before its
+/// client server is up.
+async fn run_remote_script(
+    remote_ip: &str,
+    client_port: u16,
+    request: &RunScriptRequest,
+    retry_for: Duration,
+) -> Result<RunScriptResponse> {
+    let url = run_script_url(remote_ip, client_port);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(request.timeout_secs + 10))
+        .build()?;
+    let body = serde_json::to_vec(request)?;
+    let deadline = Instant::now() + retry_for;
+    let response = loop {
+        let post = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.clone());
+        match post.send().await {
+            Ok(response) => break response,
+            Err(e) if e.is_connect() && Instant::now() < deadline => {
+                debug!("Client server at {} not reachable yet: {}", url, e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("client server answered {}: {}", status, body.trim());
+    }
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+/// How long a connect script waits for the client server of a machine that
+/// was just woken up.
+const CONNECT_SCRIPT_CLIENT_WAIT: Duration = Duration::from_secs(15);
+
+/// Runs a forward's connect script for new connections. Connections that
+/// arrive while a run is in progress share the next run instead of each
+/// starting their own, so a burst of connections (a browser loading a page)
+/// runs the script at most twice.
+struct ConnectScriptGate {
+    script: ForwardScript,
+    last_started: tokio::sync::Mutex<Option<Instant>>,
+}
+
+impl ConnectScriptGate {
+    fn new(script: ForwardScript) -> Self {
+        Self {
+            script,
+            last_started: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Runs the script for a connection accepted at `accepted_at`, unless a
+    /// run that started after that already covered it.
+    async fn run_for(&self, accepted_at: Instant, remote_ip: &str, client_port: u16, config: &Config) {
+        let mut last_started = self.last_started.lock().await;
+        if last_started.is_some_and(|started| started >= accepted_at) {
+            return;
+        }
+        *last_started = Some(Instant::now());
+        self.script
+            .run_on("connect", remote_ip, client_port, config, CONNECT_SCRIPT_CLIENT_WAIT)
+            .await;
+    }
 }
 
 /// Returns the path of an HTTP request line (`GET /path?query HTTP/1.1`),
@@ -209,6 +358,27 @@ struct MachineConfig {
     last_turn_off_attempt: Mutex<Option<Instant>>,
     last_request: Instant,
     can_be_turned_off: bool,
+    idle_scripts: Vec<ForwardScript>,
+}
+
+/// What the inactivity monitor does for a machine whose idle timer fired.
+struct IdleAction {
+    ip: Ipv4Addr,
+    turn_off_port: u16,
+    mac: String,
+    can_be_turned_off: bool,
+    idle_scripts: Vec<ForwardScript>,
+    /// The machine's last activity when the timer fired; any later activity
+    /// cancels the turn-off.
+    last_request: Instant,
+}
+
+fn idle_scripts(machine: &Machine) -> Vec<ForwardScript> {
+    machine
+        .port_forwards
+        .iter()
+        .filter_map(ForwardScript::idle)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -241,6 +411,7 @@ impl TurnOffLimiter {
             last_turn_off_attempt: Mutex::new(None),
             last_request: Instant::now(),
             can_be_turned_off: machine.can_be_turned_off,
+            idle_scripts: idle_scripts(machine),
         };
         let mut machines = self.machines.lock().unwrap();
         machines.insert(machine.ip, config);
@@ -256,6 +427,8 @@ impl TurnOffLimiter {
             config.window = Duration::from_secs(window_secs as u64);
             config.turn_off_port = turn_off_port;
             config.mac = machine.mac.clone();
+            config.can_be_turned_off = machine.can_be_turned_off;
+            config.idle_scripts = idle_scripts(machine);
             // Reset attempt timer so it can trigger again if needed
             *config.last_turn_off_attempt.lock().unwrap() = None;
             debug!(
@@ -316,6 +489,11 @@ impl TurnOffLimiter {
         }
     }
 
+    fn last_request(&self, ip: Ipv4Addr) -> Option<Instant> {
+        let machines = self.machines.lock().unwrap();
+        machines.get(&ip).map(|config| config.last_request)
+    }
+
     #[cfg(test)]
     fn secs_since_last_request(&self, ip: Ipv4Addr) -> Option<u64> {
         let machines = self.machines.lock().unwrap();
@@ -334,14 +512,14 @@ impl TurnOffLimiter {
         }
     }
 
-    pub fn start_inactivity_monitor(&self) -> tokio::task::AbortHandle {
+    pub fn start_inactivity_monitor(&self, config: Arc<Config>) -> tokio::task::AbortHandle {
         let limiter = self.clone();
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let machines_to_check: Vec<(Ipv4Addr, u16, String)> = {
+                let idle_actions: Vec<IdleAction> = {
                     let machines = limiter.machines.lock().unwrap();
                     machines
                         .iter()
@@ -351,59 +529,93 @@ impl TurnOffLimiter {
                                 "Checking inactivity for machine {} (IP: {}): last request was {:?} ago, window is {:?}",
                                 config.mac, ip, time_since_last_request, config.window
                             );
-                            if time_since_last_request > config.window {
-                                if config.can_be_turned_off {
-                                    let should_trigger = {
-                                        let mut last_attempt = config.last_turn_off_attempt.lock().unwrap();
-                                        let can_attempt = last_attempt
-                                            .map(|t| now.duration_since(t) > config.window)
-                                            .unwrap_or(true);
-                                        if can_attempt {
-                                            *last_attempt = Some(now);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    };
-                                    if should_trigger {
-                                        debug!(
-                                            "Machine {} (IP: {}) has been inactive for {:?}, exceeding window of {:?}",
-                                            config.mac, ip, time_since_last_request, config.window
-                                        );
-                                        Some((*ip, config.turn_off_port, config.mac.clone()))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
+                            if time_since_last_request <= config.window {
+                                return None;
                             }
+                            if !config.can_be_turned_off && config.idle_scripts.is_empty() {
+                                return None;
+                            }
+                            let should_trigger = {
+                                let mut last_attempt = config.last_turn_off_attempt.lock().unwrap();
+                                // A turn-off is retried every window while the
+                                // machine stays idle; idle scripts alone run
+                                // once per idle period.
+                                let can_attempt = last_attempt
+                                    .map(|t| config.can_be_turned_off && now.duration_since(t) > config.window)
+                                    .unwrap_or(true);
+                                if can_attempt {
+                                    *last_attempt = Some(now);
+                                }
+                                can_attempt
+                            };
+                            if !should_trigger {
+                                return None;
+                            }
+                            debug!(
+                                "Machine {} (IP: {}) has been inactive for {:?}, exceeding window of {:?}",
+                                config.mac, ip, time_since_last_request, config.window
+                            );
+                            Some(IdleAction {
+                                ip: *ip,
+                                turn_off_port: config.turn_off_port,
+                                mac: config.mac.clone(),
+                                can_be_turned_off: config.can_be_turned_off,
+                                idle_scripts: config.idle_scripts.clone(),
+                                last_request: config.last_request,
+                            })
                         })
                         .collect()
                 };
 
-                for (ip, turn_off_port, mac) in machines_to_check {
-                    let remote_ip = ip.to_string();
-                    let limiter = limiter.clone();
-                    debug!(
-                        "Sending turn-off signal for inactive machine {} (IP: {})",
-                        mac, remote_ip
-                    );
-                    tokio::spawn(async move {
-                        match turn_off_remote_machine(&remote_ip, turn_off_port).await {
-                            Ok(_) => limiter.mark_offline(&mac),
-                            Err(e) => error!(
-                                "Failed to send turn-off signal for inactive machine {} on {}:{}: {}",
-                                mac, remote_ip, turn_off_port, e
-                            ),
-                        }
-                    });
+                for action in idle_actions {
+                    tokio::spawn(limiter.clone().run_idle_action(action, Arc::clone(&config)));
                 }
             }
         }).abort_handle();
         handle
+    }
+
+    /// Runs a machine's idle scripts and waits for them to exit, then turns
+    /// the machine off unless it became active in the meantime. The scripts'
+    /// run time is the grace period: a script can wait for work to finish
+    /// before the machine goes down.
+    async fn run_idle_action(self, action: IdleAction, config: Arc<Config>) {
+        let remote_ip = action.ip.to_string();
+        if !action.idle_scripts.is_empty() {
+            info!(
+                "Machine {} (IP: {}) is idle, running {} idle script(s)",
+                action.mac,
+                remote_ip,
+                action.idle_scripts.len()
+            );
+            for script in &action.idle_scripts {
+                script
+                    .run_on("idle", &remote_ip, action.turn_off_port, &config, Duration::ZERO)
+                    .await;
+            }
+            if !action.can_be_turned_off {
+                return;
+            }
+            if self.last_request(action.ip) != Some(action.last_request) {
+                info!(
+                    "Machine {} (IP: {}) became active while its idle scripts ran, not turning it off",
+                    action.mac, remote_ip
+                );
+                return;
+            }
+        }
+
+        debug!(
+            "Sending turn-off signal for inactive machine {} (IP: {})",
+            action.mac, remote_ip
+        );
+        match turn_off_remote_machine(&remote_ip, action.turn_off_port).await {
+            Ok(_) => self.mark_offline(&action.mac),
+            Err(e) => error!(
+                "Failed to send turn-off signal for inactive machine {} on {}:{}: {}",
+                action.mac, remote_ip, action.turn_off_port, e
+            ),
+        }
     }
 
     pub async fn proxy_internal(
@@ -464,6 +676,13 @@ impl TurnOffLimiter {
             .map(|pf| pf.no_wake_paths.clone())
             .unwrap_or_default()
             .into();
+        let connect_script: Option<Arc<ConnectScriptGate>> = machine
+            .port_forwards
+            .iter()
+            .find(|pf| pf.local_port == local_port)
+            .and_then(ForwardScript::connect)
+            .map(|script| Arc::new(ConnectScriptGate::new(script)));
+        let client_port = machine.turn_off_port.unwrap_or(config.server.client_port);
 
         // Note: Monitor is started globally, not per proxy
 
@@ -478,6 +697,7 @@ impl TurnOffLimiter {
                 result = listener.accept() => {
                     let (inbound, client_addr) = result
                         .context("Failed to accept incoming connection")?;
+                    let accepted_at = Instant::now();
                     info!(
                         "Accepted connection from {} to forward to {}",
                         client_addr, remote_addr
@@ -489,6 +709,7 @@ impl TurnOffLimiter {
                     let machine_ip_clone = machine_ip;
                     let config_clone = Arc::clone(&config);
                     let no_wake_paths = Arc::clone(&no_wake_paths);
+                    let connect_script = connect_script.clone();
 
                     // Accepting a connection is not activity on its own. The
                     // connection refreshes the idle timer each time it carries
@@ -568,6 +789,16 @@ impl TurnOffLimiter {
                             }
 
                             rate_limiter.mark_online(&mac_str_clone);
+
+                            if let Some(gate) = &connect_script {
+                                gate.run_for(
+                                    accepted_at,
+                                    &machine_ip_clone.to_string(),
+                                    client_port,
+                                    &config_clone,
+                                )
+                                .await;
+                            }
 
                             let mut outbound = match tokio::time::timeout(
                                 Duration::from_secs(30),
@@ -923,5 +1154,140 @@ mod tests {
             matches!(host_value, Some(value) if value.eq_ignore_ascii_case(&expected_ip) || value.eq_ignore_ascii_case(&expected_with_port)),
             "unexpected host header: {host_line}"
         );
+    }
+
+    /// A stand-in client server that records the paths it is asked for and
+    /// answers every script with exit code 0, after 500ms for `slow-*` scripts.
+    async fn fake_client_server() -> Option<(u16, Arc<std::sync::Mutex<Vec<String>>>)> {
+        use axum::{routing::post, Json, Router};
+        let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let script_hits = Arc::clone(&hits);
+        let turn_off_hits = Arc::clone(&hits);
+        let app = Router::new()
+            .route(
+                "/scripts/run",
+                post(move |Json(request): Json<RunScriptRequest>| async move {
+                    if request.script.starts_with("slow-") {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    script_hits
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{}", request.event, request.script));
+                    Json(RunScriptResponse {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }),
+            )
+            .route(
+                "/machines/turn-off",
+                post(move || async move {
+                    turn_off_hits.lock().unwrap().push("turn-off".to_string());
+                    "ok"
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let port = listener.local_addr().ok()?.port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Some((port, hits))
+    }
+
+    fn script(text: &str) -> ForwardScript {
+        ForwardScript {
+            local_port: 8080,
+            target_port: 80,
+            script: text.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_script_gate_runs_once_for_connections_it_covers() {
+        let Some((port, hits)) = fake_client_server().await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        let config = Config::default();
+        let gate = ConnectScriptGate::new(script("start-service"));
+
+        let burst = Instant::now();
+        gate.run_for(burst, "127.0.0.1", port, &config).await;
+        // Accepted before the first run started, so that run covered it.
+        gate.run_for(burst, "127.0.0.1", port, &config).await;
+        assert_eq!(hits.lock().unwrap().len(), 1);
+
+        gate.run_for(Instant::now(), "127.0.0.1", port, &config).await;
+        assert_eq!(*hits.lock().unwrap(), vec!["connect:start-service"; 2]);
+    }
+
+    #[tokio::test]
+    async fn run_remote_script_reports_client_refusal_as_error() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/scripts/run",
+            post(|| async { (StatusCode::FORBIDDEN, "Scripts are disabled") }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let request = RunScriptRequest {
+            event: "idle".into(),
+            script: "true".into(),
+            local_port: 8080,
+            target_port: 80,
+            timeout_secs: 5,
+        };
+        let err = run_remote_script("127.0.0.1", port, &request, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    fn idle_action(limiter: &TurnOffLimiter, port: u16, idle_script: &str) -> IdleAction {
+        let ip = Ipv4Addr::LOCALHOST;
+        let mut machine = test_machine();
+        machine.ip = ip;
+        limiter.initialize_machine(&machine, port);
+        IdleAction {
+            ip,
+            turn_off_port: port,
+            mac: machine.mac,
+            can_be_turned_off: true,
+            idle_scripts: vec![script(idle_script)],
+            last_request: limiter.last_request(ip).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_action_turns_off_once_idle_scripts_exit() {
+        let Some((port, hits)) = fake_client_server().await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        let limiter = TurnOffLimiter::new();
+        let action = idle_action(&limiter, port, "slow-stop");
+        limiter.clone().run_idle_action(action, Arc::default()).await;
+        assert_eq!(*hits.lock().unwrap(), vec!["idle:slow-stop", "turn-off"]);
+    }
+
+    #[tokio::test]
+    async fn activity_while_idle_scripts_run_cancels_turn_off() {
+        let Some((port, hits)) = fake_client_server().await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        let limiter = TurnOffLimiter::new();
+        let action = idle_action(&limiter, port, "slow-stop");
+        let task = tokio::spawn(limiter.clone().run_idle_action(action, Arc::default()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        limiter.update_last_request(Ipv4Addr::LOCALHOST);
+        task.await.unwrap();
+        assert_eq!(*hits.lock().unwrap(), vec!["idle:slow-stop"]);
     }
 }

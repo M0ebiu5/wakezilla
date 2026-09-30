@@ -86,6 +86,15 @@ pub struct PortForward {
     pub target_port: u16,
     #[serde(default)]
     pub no_wake_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_connect_script: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_idle_script: Option<String>,
+}
+
+/// Blank scripts are stored as "no script".
+fn non_blank_script(script: &Option<String>) -> Option<String> {
+    script.clone().filter(|s| !s.trim().is_empty())
 }
 
 pub fn validate_ip(ip: &str) -> Result<(), ValidationError> {
@@ -125,6 +134,8 @@ pub fn api_port_forward_to_internal(pf: &wakezilla_common::PortForward) -> PortF
         local_port: pf.local_port,
         target_port: pf.target_port,
         no_wake_paths: pf.no_wake_paths.clone(),
+        on_connect_script: non_blank_script(&pf.on_connect_script),
+        on_idle_script: non_blank_script(&pf.on_idle_script),
     }
 }
 
@@ -138,6 +149,8 @@ pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortF
         local_port: pf.local_port,
         target_port: pf.target_port,
         no_wake_paths: pf.no_wake_paths.clone(),
+        on_connect_script: pf.on_connect_script.clone(),
+        on_idle_script: pf.on_idle_script.clone(),
     }
 }
 
@@ -282,7 +295,9 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
 pub fn start_global_monitor(state: &AppState) {
     let mut handle_guard = state.monitor_handle.lock().unwrap();
     if handle_guard.is_none() {
-        let handle = state.turn_off_limiter.start_inactivity_monitor();
+        let handle = state
+            .turn_off_limiter
+            .start_inactivity_monitor(Arc::clone(&state.config));
         *handle_guard = Some(handle);
         info!("Started global inactivity monitor");
     }
@@ -294,7 +309,9 @@ pub fn restart_global_monitor(state: &AppState) {
         handle.abort();
         info!("Stopped old inactivity monitor");
     }
-    let handle = state.turn_off_limiter.start_inactivity_monitor();
+    let handle = state
+            .turn_off_limiter
+            .start_inactivity_monitor(Arc::clone(&state.config));
     *handle_guard = Some(handle);
     info!("Restarted global inactivity monitor");
 }

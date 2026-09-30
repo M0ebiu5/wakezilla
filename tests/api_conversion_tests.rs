@@ -7,6 +7,8 @@ fn api_port_forward_allows_missing_name() {
         local_port: 2222,
         target_port: 22,
         no_wake_paths: vec![],
+        on_connect_script: None,
+        on_idle_script: None,
     };
 
     let internal = api_port_forward_to_internal(&pf);
