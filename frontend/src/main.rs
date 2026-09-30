@@ -597,7 +597,7 @@ fn MachineDetailPage() -> impl IntoView {
                                                         }
                                                     />
                                                     <p class="field-help">
-                                                        "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
+                                                        "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine and never run the connect script. A trailing * matches a prefix."
                                                     </p>
                                                 </div>
                                                 <PortForwardScripts
@@ -1870,7 +1870,7 @@ fn AddMachine(
                                                     }
                                                 />
                                                 <p class="field-help">
-                                                    "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine. A trailing * matches a prefix."
+                                                    "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine and never run the connect script. A trailing * matches a prefix."
                                                 </p>
                                             </div>
                                             <PortForwardScripts

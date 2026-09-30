@@ -724,6 +724,9 @@ impl TurnOffLimiter {
                     tokio::spawn(async move {
                         'conn: {
                             let connect_timeout = Duration::from_millis(1000);
+                            // Whether the request was already found not to be
+                            // a background (no_wake_paths) request.
+                            let mut checked_background = false;
                             if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
                                 // Background requests (e.g. a web app polling
                                 // for updates) must not wake a sleeping machine.
@@ -736,6 +739,7 @@ impl TurnOffLimiter {
                                     );
                                     break 'conn;
                                 }
+                                checked_background = true;
                                 info!(
                                     "Host {} seems to be down. Sending WOL packet to MAC {}.",
                                     remote_addr_clone, mac_str_clone
@@ -791,13 +795,29 @@ impl TurnOffLimiter {
                             rate_limiter.mark_online(&mac_str_clone);
 
                             if let Some(gate) = &connect_script {
-                                gate.run_for(
-                                    accepted_at,
-                                    &machine_ip_clone.to_string(),
-                                    client_port,
-                                    &config_clone,
-                                )
-                                .await;
+                                // Background requests don't run the connect
+                                // script either: a browser tab left open must
+                                // not keep switching the machine's services.
+                                let background = if checked_background {
+                                    None
+                                } else {
+                                    no_wake_request_path(&inbound, &no_wake_paths).await
+                                };
+                                match background {
+                                    Some(path) => debug!(
+                                        "Not running connect script for {} from {}",
+                                        path, client_addr
+                                    ),
+                                    None => {
+                                        gate.run_for(
+                                            accepted_at,
+                                            &machine_ip_clone.to_string(),
+                                            client_port,
+                                            &config_clone,
+                                        )
+                                        .await
+                                    }
+                                }
                             }
 
                             let mut outbound = match tokio::time::timeout(
@@ -1289,5 +1309,68 @@ mod tests {
         limiter.update_last_request(Ipv4Addr::LOCALHOST);
         task.await.unwrap();
         assert_eq!(*hits.lock().unwrap(), vec!["idle:slow-stop"]);
+    }
+
+    #[tokio::test]
+    async fn background_requests_do_not_run_the_connect_script() {
+        let Some((client_port, hits)) = fake_client_server().await else {
+            eprintln!("skipping test because binding TCP sockets is not permitted");
+            return;
+        };
+        // The forwarded service: answers each request, then closes.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = upstream.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = conn.read(&mut buf).await;
+                    let _ = conn.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+                });
+            }
+        });
+        let local_port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        let mut machine = test_machine();
+        machine.ip = Ipv4Addr::LOCALHOST;
+        machine.turn_off_port = Some(client_port);
+        machine.port_forwards = vec![crate::web::PortForward {
+            name: "webui".into(),
+            local_port,
+            target_port: upstream_addr.port(),
+            no_wake_paths: vec!["/_app/version.json".into()],
+            on_connect_script: Some("gpu-switch webui".into()),
+            on_idle_script: None,
+        }];
+        let limiter = TurnOffLimiter::new();
+        let (_tx, rx) = watch::channel(true);
+        tokio::spawn(async move {
+            limiter
+                .proxy_internal(local_port, upstream_addr, machine, rx, Arc::default())
+                .await
+        });
+
+        let request = |path: &'static str| async move {
+            let mut conn = loop {
+                match TcpStream::connect(("127.0.0.1", local_port)).await {
+                    Ok(conn) => break conn,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            };
+            conn.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            conn.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"), "{path} was not forwarded");
+        };
+
+        request("/_app/version.json").await;
+        assert!(hits.lock().unwrap().is_empty());
+        request("/c/some-chat").await;
+        assert_eq!(*hits.lock().unwrap(), vec!["connect:gpu-switch webui"]);
     }
 }

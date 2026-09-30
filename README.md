@@ -177,8 +177,9 @@ Each port forward can have two shell scripts that the machine's client server ru
 - **Script on new connection** runs for each new connection, after the machine is awake
   (and woken if needed) and before the connection is forwarded. The connection waits for it,
   so it can e.g. start the service behind the port. Connections arriving while it runs share
-  the next run instead of starting one each. Requests dropped by "Paths that don't wake the
-  machine" don't run it.
+  the next run instead of starting one each. Requests matching "Paths that don't wake the
+  machine" never run it, even while the machine is up, so a browser tab left open doesn't keep
+  re-running it.
 - **Script when idle** runs when the machine's inactivity period ends. The machine is turned off
   once the script exits, so its run time is the grace period (e.g. `sleep 60`, or wait for a job
   to finish); activity while it runs cancels the turn-off. On machines that can't be turned off,
