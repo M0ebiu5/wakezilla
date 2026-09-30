@@ -146,6 +146,10 @@ Each machine can be configured with:
   - Local Port: Port on the server
   - Target Port: Port on the remote machine
   - Script on new connection / Script when idle (optional, see [Port-forward scripts](#port-forward-scripts))
+  - Web link (`http` default, `https`, or off for non-web services like SSH) and optional link path:
+    the dashboard's **Services** card links to each forward as "Machine · Service". Links open the
+    forwarded port on the host you reached wakezilla by, so opening one wakes the machine and runs
+    its connect script
 
 ## How It Works
 

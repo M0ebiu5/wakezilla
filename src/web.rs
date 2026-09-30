@@ -90,6 +90,10 @@ pub struct PortForward {
     pub on_connect_script: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_idle_script: Option<String>,
+    #[serde(default, skip_serializing_if = "wakezilla_common::LinkScheme::is_default")]
+    pub link: wakezilla_common::LinkScheme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_path: Option<String>,
 }
 
 /// Blank scripts are stored as "no script".
@@ -136,6 +140,8 @@ pub fn api_port_forward_to_internal(pf: &wakezilla_common::PortForward) -> PortF
         no_wake_paths: pf.no_wake_paths.clone(),
         on_connect_script: non_blank_script(&pf.on_connect_script),
         on_idle_script: non_blank_script(&pf.on_idle_script),
+        link: pf.link,
+        link_path: pf.link_path.clone().filter(|p| !p.trim().is_empty()),
     }
 }
 
@@ -151,6 +157,8 @@ pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortF
         no_wake_paths: pf.no_wake_paths.clone(),
         on_connect_script: pf.on_connect_script.clone(),
         on_idle_script: pf.on_idle_script.clone(),
+        link: pf.link,
+        link_path: pf.link_path.clone(),
     }
 }
 

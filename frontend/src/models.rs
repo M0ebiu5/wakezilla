@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub use wakezilla_common::{
-    DiscoveredDevice, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
+    DiscoveredDevice, LinkScheme, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
 };
 
 pub fn validate_machine_form(machine: &Machine) -> HashMap<String, Vec<String>> {

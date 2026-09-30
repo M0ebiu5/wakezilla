@@ -1367,6 +1367,8 @@ mod tests {
             no_wake_paths: vec!["/_app/version.json".into()],
             on_connect_script: Some("gpu-switch webui".into()),
             on_idle_script: None,
+            link: Default::default(),
+            link_path: None,
         }];
         let limiter = TurnOffLimiter::new();
         let (_tx, rx) = watch::channel(true);
@@ -1423,6 +1425,8 @@ mod tests {
             no_wake_paths: vec![],
             on_connect_script: Some("start-qbittorrent".into()),
             on_idle_script: None,
+            link: Default::default(),
+            link_path: None,
         }];
         let limiter = TurnOffLimiter::new();
         let (_tx, rx) = watch::channel(true);

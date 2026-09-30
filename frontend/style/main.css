@@ -1389,3 +1389,110 @@ code {
         padding: 0 1rem 1rem;
     }
 }
+
+/* Services card: one tile per forwarded web service */
+.service-grid {
+    display: grid;
+    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+}
+
+.service-tile {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 0;
+    padding: 0.85rem 1rem;
+    border-radius: 14px;
+    border: 1px solid rgba(226, 232, 240, 0.9);
+    background: linear-gradient(145deg, rgba(248, 250, 252, 0.95), rgba(237, 242, 255, 0.75));
+    color: inherit;
+    text-decoration: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.service-tile:hover,
+.service-tile:focus-visible {
+    border-color: var(--color-primary);
+    box-shadow: 0 8px 24px -16px rgba(37, 99, 235, 0.6);
+    transform: translateY(-1px);
+    outline: none;
+}
+
+.service-tile__dot {
+    flex: none;
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 999px;
+    background: #cbd5e1;
+}
+
+.service-tile__dot--online {
+    background: var(--color-success);
+    box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18);
+}
+
+.service-tile__dot--offline {
+    background: #94a3b8;
+}
+
+.service-tile__text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+    flex: 1;
+}
+
+.service-tile__label {
+    font-weight: 600;
+    color: #1f2937;
+    overflow-wrap: anywhere;
+}
+
+.service-tile__meta {
+    font-size: 0.8rem;
+    color: var(--color-muted);
+    font-family: "Fira Code", "Source Code Pro", monospace;
+}
+
+.service-tile__arrow {
+    flex: none;
+    color: var(--color-primary);
+    font-weight: 600;
+}
+
+/* Registered machines: forwards column, one per line */
+.forward-links {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.port-forward-item__open {
+    margin-left: auto;
+    color: var(--color-primary);
+    text-decoration: none;
+}
+
+.port-forward-item__open:hover {
+    background: rgba(37, 99, 235, 0.08);
+}
+
+/* With an Open link, Remove sits right next to it instead of splitting the space. */
+.port-forward-item__open + .port-forward-item__remove {
+    margin-left: 0;
+}
+
+/* Network scan inside the "Add new machine" card */
+.scan-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding-bottom: 1.25rem;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.scan-section__label {
+    font-weight: 600;
+}

@@ -22,7 +22,7 @@ use crate::api::{
     get_details_machine, is_machine_online, turn_off_machine, wake_machine,
 };
 use crate::models::{
-    DiscoveredDevice, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
+    DiscoveredDevice, LinkScheme, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
     validate_machine_form,
 };
 
@@ -415,6 +415,8 @@ fn MachineDetailPage() -> impl IntoView {
                                                 no_wake_paths: vec![],
                                                 on_connect_script: None,
                                                 on_idle_script: None,
+                                                link: Default::default(),
+                                                link_path: None,
                                             });
                                         });
                                 }
@@ -462,6 +464,25 @@ fn MachineDetailPage() -> impl IntoView {
                                                     <span class="port-forward-item__title">
                                                         {forward_label}
                                                     </span>
+                                                    {move || {
+                                                        port_forwards
+                                                            .get()
+                                                            .get(idx)
+                                                            .and_then(|pf| pf.link_url(&wakezilla_host()))
+                                                            .map(|url| {
+                                                                view! {
+                                                                    <a
+                                                                        class="btn btn-ghost btn-sm port-forward-item__open"
+                                                                        href=url.clone()
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                        title=url
+                                                                    >
+                                                                        "Open ↗"
+                                                                    </a>
+                                                                }
+                                                            })
+                                                    }}
                                                     <button
                                                         type="button"
                                                         class="btn btn-ghost btn-sm port-forward-item__remove"
@@ -600,6 +621,11 @@ fn MachineDetailPage() -> impl IntoView {
                                                         "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine and never run the connect script. A trailing * matches a prefix."
                                                     </p>
                                                 </div>
+                                                <PortForwardLink
+                                                    idx=idx
+                                                    port_forwards=port_forwards
+                                                    set_port_forwards=set_port_forwards
+                                                />
                                                 <PortForwardScripts
                                                     idx=idx
                                                     port_forwards=port_forwards
@@ -744,6 +770,179 @@ fn App() -> impl IntoView {
     }
 }
 
+/// Host the browser uses for wakezilla itself. Service links point at the
+/// forwarded ports on this same host, so they work however wakezilla was
+/// reached (LAN IP, hostname, VPN address).
+fn wakezilla_host() -> String {
+    window()
+        .and_then(|w| w.location().hostname().ok())
+        .unwrap_or_default()
+}
+
+/// Editor for how the web UI links to a port forward.
+#[component]
+fn PortForwardLink(
+    idx: usize,
+    port_forwards: ReadSignal<Vec<PortForward>>,
+    set_port_forwards: WriteSignal<Vec<PortForward>>,
+) -> impl IntoView {
+    let link = move || {
+        port_forwards
+            .get()
+            .get(idx)
+            .map(|pf| pf.link)
+            .unwrap_or_default()
+    };
+    let scheme_value = move || match link() {
+        LinkScheme::Http => "http",
+        LinkScheme::Https => "https",
+        LinkScheme::Off => "off",
+    };
+
+    view! {
+        <div class="form-grid two-column">
+            <div class="field">
+                <label for=format!("pf-link-{}", idx + 1)>"Web link"</label>
+                <select
+                    id=format!("pf-link-{}", idx + 1)
+                    prop:value=scheme_value
+                    on:change=move |ev| {
+                        let scheme = match event_target_value(&ev).as_str() {
+                            "https" => LinkScheme::Https,
+                            "off" => LinkScheme::Off,
+                            _ => LinkScheme::Http,
+                        };
+                        set_port_forwards.update(|pfs| {
+                            if let Some(pf) = pfs.get_mut(idx) {
+                                pf.link = scheme;
+                            }
+                        });
+                    }
+                >
+                    <option value="http">"http"</option>
+                    <option value="https">"https"</option>
+                    <option value="off">"Off (not a web page)"</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for=format!("pf-link-path-{}", idx + 1)>"Link path"</label>
+                <input
+                    class="input"
+                    id=format!("pf-link-path-{}", idx + 1)
+                    placeholder="/"
+                    disabled=move || link() == LinkScheme::Off
+                    prop:value=move || {
+                        port_forwards
+                            .get()
+                            .get(idx)
+                            .and_then(|pf| pf.link_path.clone())
+                            .unwrap_or_default()
+                    }
+                    on:change=move |ev| {
+                        let value = event_target_value(&ev);
+                        let path = if value.trim().is_empty() { None } else { Some(value.trim().to_string()) };
+                        set_port_forwards.update(|pfs| {
+                            if let Some(pf) = pfs.get_mut(idx) {
+                                pf.link_path = path;
+                            }
+                        });
+                    }
+                />
+            </div>
+        </div>
+        <p class="field-help">
+            "Adds a link to this service on the dashboard. It opens the forwarded port on the wakezilla server, so the machine is woken and the connect script runs."
+        </p>
+    }
+}
+
+/// One link on the dashboard: a forwarded web service.
+#[derive(Clone, PartialEq)]
+struct ServiceLink {
+    mac: String,
+    label: String,
+    url: String,
+    local_port: u16,
+    target: String,
+}
+
+fn service_links(machines: &[Machine], host: &str) -> Vec<ServiceLink> {
+    machines
+        .iter()
+        .flat_map(|machine| {
+            machine.port_forwards.iter().filter_map(move |pf| {
+                Some(ServiceLink {
+                    mac: machine.mac.clone(),
+                    label: pf.link_label(&machine.name),
+                    url: pf.link_url(host)?,
+                    local_port: pf.local_port,
+                    target: format!("{}:{}", machine.ip, pf.target_port),
+                })
+            })
+        })
+        .collect()
+}
+
+/// Dashboard card linking to every forwarded web service.
+#[component]
+fn ServicesCard(
+    machines: ReadSignal<Vec<Machine>>,
+    status_machine: ReadSignal<HashMap<String, bool>>,
+) -> impl IntoView {
+    let links = move || service_links(&machines.get(), &wakezilla_host());
+
+    view! {
+        <Show when=move || !links().is_empty() fallback=|| view! {}>
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">"Services"</h2>
+                    <p class="card-subtitle">
+                        "Opens in a new tab. A sleeping machine is woken first; the first load can take up to a minute."
+                    </p>
+                </div>
+                <div class="service-grid">
+                    <For
+                        each=links
+                        key=|link| link.url.clone()
+                        children=move |link| {
+                            let mac = link.mac.clone();
+                            let status = Memo::new(move |_| status_machine.get().get(&mac).copied());
+                            let title = format!("{} → {}", link.url, link.target);
+                            view! {
+                                <a
+                                    class="service-tile"
+                                    href=link.url.clone()
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    title=title
+                                >
+                                    <span
+                                        class="service-tile__dot"
+                                        class:service-tile__dot--online=move || status.get() == Some(true)
+                                        class:service-tile__dot--offline=move || status.get() == Some(false)
+                                    ></span>
+                                    <span class="service-tile__text">
+                                        <span class="service-tile__label">{link.label.clone()}</span>
+                                        <span class="service-tile__meta">
+                                            {format!(":{}", link.local_port)}
+                                            {move || match status.get() {
+                                                Some(false) => " · asleep, opening wakes it",
+                                                None => " · checking…",
+                                                Some(true) => "",
+                                            }}
+                                        </span>
+                                    </span>
+                                    <span class="service-tile__arrow" aria-hidden="true">"↗"</span>
+                                </a>
+                            }
+                        }
+                    />
+                </div>
+            </section>
+        </Show>
+    }
+}
+
 /// Editors for a port forward's connect and idle scripts, which the
 /// machine's client server runs.
 #[component]
@@ -802,7 +1001,34 @@ fn PortForwardScripts(
 }
 
 #[component]
-fn Header(
+fn Header() -> impl IntoView {
+    view! {
+        <div class="section-stack">
+            <div class="card scan-card">
+                <header class="card-header card-header--with-logo">
+                    <div class="card-header__text">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <img
+                                src="/images/wakezilla.png"
+                                alt="Wakezilla logo"
+                                class="card-header__logo"
+                            />
+                            <h1 class="">"Wakezilla"</h1>
+                        </div>
+                        <p class="card-subtitle">
+                            "Wake, manage, and forward to your registered machines."
+                        </p>
+                    </div>
+                </header>
+            </div>
+        </div>
+    }
+}
+
+/// Network scan in the "Add new machine" card: picking a discovered device
+/// pre-fills the form below it.
+#[component]
+fn NetworkScan(
     set_machine: WriteSignal<Machine>,
     registred_machines: ReadSignal<Vec<Machine>>,
 ) -> impl IntoView {
@@ -883,6 +1109,8 @@ fn Header(
                 no_wake_paths: vec![],
                 on_connect_script: None,
                 on_idle_script: None,
+                link: Default::default(),
+                link_path: None,
             }],
             idle_minutes: None,
             offline_minutes: None,
@@ -892,110 +1120,88 @@ fn Header(
     }
 
     view! {
-        <div class="section-stack">
-            <div class="card scan-card">
-                <header class="card-header card-header--with-logo">
-                    <div class="card-header__text">
-                        <div style="display: flex; align-items: center; gap: 10px;">
-                            <img
-                                src="/images/wakezilla.png"
-                                alt="Wakezilla logo"
-                                class="card-header__logo"
-                            />
-                            <h1 class="">"Wakezilla"</h1>
-                        </div>
-                        <p class="card-subtitle">
-                            "Wake, manage, and forward to your registered machines."
-                        </p>
-                    </div>
-                </header>
-                <form on:submit=on_submit class="scan-grid">
-                    <select
-                        id="interface-select"
-                        class="input"
-                        on:change:target=move |ev| {
-                            handle_interface_change(ev.target().value(), set_interface);
-                        }
-                        prop:value=move || interface.get().to_string()
-                    >
-                        <option value="">"Auto-detect interface"</option>
-                        {move || {
-                            interfaces
-                                .get()
-                                .iter()
-                                .map(|iface| {
-                                    view! {
-                                        <option value=iface
-                                            .name
-                                            .clone()>
-                                            {format!("{} · {} ({})", iface.name, iface.ip, iface.mac)}
-                                        </option>
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        }}
-                    </select>
-                    <button id="scan-btn" class="btn btn-primary" disabled=move || loading.get()>
-                        {move || { if loading.get() { "Scanning…" } else { "Scan network" } }}
-                    </button>
-                </form>
-            </div>
-
+        <div class="scan-section">
+            <label class="scan-section__label" for="interface-select">
+                "Find devices on your network"
+            </label>
+            <form on:submit=on_submit class="scan-grid">
+                <select
+                    id="interface-select"
+                    class="input"
+                    on:change:target=move |ev| {
+                        handle_interface_change(ev.target().value(), set_interface);
+                    }
+                    prop:value=move || interface.get().to_string()
+                >
+                    <option value="">"Auto-detect interface"</option>
+                    {move || {
+                        interfaces
+                            .get()
+                            .iter()
+                            .map(|iface| {
+                                view! {
+                                    <option value=iface
+                                        .name
+                                        .clone()>
+                                        {format!("{} · {} ({})", iface.name, iface.ip, iface.mac)}
+                                    </option>
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }}
+                </select>
+                <button id="scan-btn" class="btn btn-primary" disabled=move || loading.get()>
+                    {move || { if loading.get() { "Scanning…" } else { "Scan network" } }}
+                </button>
+            </form>
             <Show when=move || { !discovered_devices.get().is_empty() } fallback=|| view! { <></> }>
-                <div class="card table-card" id="scan-results-container">
-                    <div class="card-header">
-                        <h3 class="card-title">"Discovered devices"</h3>
-                        <p class="card-subtitle">
-                            "Tap a device to pre-fill the create form below."
-                        </p>
-                    </div>
-                    <div class="table-container">
-                        <table class="table" id="scan-results-table">
-                            <thead>
-                                <tr>
-                                    <th>"IP address"</th>
-                                    <th>"Hostname"</th>
-                                    <th>"MAC address"</th>
-                                    <th>"Action"</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <For
-                                    each=move || discovered_devices.get()
-                                    key=|device| device.ip.clone()
-                                    children=move |device| {
-                                        view! {
-                                            <tr>
-                                                <td attr:data-label="IP address">{device.ip.clone()}</td>
-                                                <td attr:data-label="Hostname">
-                                                    {device
-                                                        .hostname
-                                                        .clone()
-                                                        .unwrap_or_else(|| "N/A".to_string())}
-                                                </td>
-                                                <td attr:data-label="MAC address">{device.mac.clone()}</td>
-                                                <td attr:data-label="Action" class="table-actions">
-                                                    <button
-                                                        class="btn-icon btn-icon--positive"
-                                                        title="Use this device"
-                                                        on:click=move |_| {
-                                                            handle_add_machine(
-                                                                device.clone(),
-                                                                set_machine,
-                                                                set_discovered_devices,
-                                                            );
-                                                        }
-                                                    >
-                                                        "＋"
-                                                    </button>
-                                                </td>
-                                            </tr>
-                                        }
+                <p class="field-help">"Pick a device to pre-fill the form below."</p>
+                <div class="table-container">
+                    <table class="table" id="scan-results-table">
+                        <thead>
+                            <tr>
+                                <th>"IP address"</th>
+                                <th>"Hostname"</th>
+                                <th>"MAC address"</th>
+                                <th>"Action"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <For
+                                each=move || discovered_devices.get()
+                                key=|device| device.ip.clone()
+                                children=move |device| {
+                                    view! {
+                                        <tr>
+                                            <td attr:data-label="IP address">{device.ip.clone()}</td>
+                                            <td attr:data-label="Hostname">
+                                                {device
+                                                    .hostname
+                                                    .clone()
+                                                    .unwrap_or_else(|| "N/A".to_string())}
+                                            </td>
+                                            <td attr:data-label="MAC address">{device.mac.clone()}</td>
+                                            <td attr:data-label="Action" class="table-actions">
+                                                <button
+                                                    class="btn-icon btn-icon--positive"
+                                                    title="Use this device"
+                                                    on:click=move |_| {
+                                                        handle_add_machine(
+                                                            device.clone(),
+                                                            set_machine,
+                                                            set_discovered_devices,
+                                                        );
+                                                    }
+                                                >
+                                                    "＋"
+                                                </button>
+                                            </td>
+                                        </tr>
                                     }
-                                />
-                            </tbody>
-                        </table>
-                    </div>
+                                }
+                            />
+                        </tbody>
+                    </table>
                 </div>
             </Show>
         </div>
@@ -1129,26 +1335,40 @@ fn RegistredMachines(
                                     } else {
                                         "No".to_string()
                                     };
-                                    let port_forwards_text = if machine.port_forwards.is_empty() {
-                                        "-".to_string()
+                                    // "3002 → 3000 (webui)" per forward, linked when
+                                    // the forward has a web link.
+                                    let host = wakezilla_host();
+                                    let forward_cells = if machine.port_forwards.is_empty() {
+                                        view! { "-" }.into_any()
                                     } else {
                                         machine
                                             .port_forwards
                                             .iter()
                                             .map(|pf| {
-                                                let pf_name = pf
-                                                    .name
-                                                    .clone()
-                                                    .unwrap_or_else(|| "-".to_string());
-                                                format!(
+                                                let text = format!(
                                                     "{} → {} ({})",
                                                     pf.local_port,
                                                     pf.target_port,
-                                                    pf_name,
-                                                )
+                                                    pf.name.clone().unwrap_or_else(|| "-".to_string()),
+                                                );
+                                                match pf.link_url(&host) {
+                                                    Some(url) => view! {
+                                                        <a
+                                                            class="text-link"
+                                                            href=url.clone()
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            title=format!("Open {}", url)
+                                                        >
+                                                            {text}
+                                                        </a>
+                                                    }
+                                                    .into_any(),
+                                                    None => view! { <span>{text}</span> }.into_any(),
+                                                }
                                             })
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
+                                            .collect_view()
+                                            .into_any()
                                     };
                                     let mobile_port_forward_labels: Vec<String> = if machine
                                         .port_forwards
@@ -1258,8 +1478,8 @@ fn RegistredMachines(
                                                 </span>
                                             </td>
                                             <td class="hide-mobile">
-                                                <span class="font-mono text-xs sm:text-sm">
-                                                    {move || port_forwards_text.clone()}
+                                                <span class="font-mono text-xs sm:text-sm forward-links">
+                                                    {forward_cells}
                                                 </span>
                                             </td>
                                             <td class="table-actions">
@@ -1457,6 +1677,7 @@ fn RegistredMachines(
 #[component]
 fn AddMachine(
     machine: ReadSignal<Machine>,
+    set_machine: WriteSignal<Machine>,
     registred_machines: ReadSignal<Vec<Machine>>,
     set_registred_machines: WriteSignal<Vec<Machine>>,
 ) -> impl IntoView {
@@ -1583,6 +1804,7 @@ fn AddMachine(
                     }}
                 </p>
             </header>
+            <NetworkScan set_machine=set_machine registred_machines=registred_machines />
             <form on:submit=on_submit class="form-grid">
                 <div class="form-grid two-column">
                     <div class="field">
@@ -1696,6 +1918,8 @@ fn AddMachine(
                                             no_wake_paths: vec![],
                                             on_connect_script: None,
                                             on_idle_script: None,
+                                            link: Default::default(),
+                                            link_path: None,
                                         });
                                     });
                             }
@@ -1873,6 +2097,11 @@ fn AddMachine(
                                                     "Comma-separated HTTP paths, e.g. background polling. Requests to them are dropped instead of waking a sleeping machine and never run the connect script. A trailing * matches a prefix."
                                                 </p>
                                             </div>
+                                            <PortForwardLink
+                                                idx=idx
+                                                port_forwards=port_forwards
+                                                set_port_forwards=set_port_forwards
+                                            />
                                             <PortForwardScripts
                                                 idx=idx
                                                 port_forwards=port_forwards
@@ -1976,6 +2205,8 @@ fn HomePage() -> impl IntoView {
             no_wake_paths: vec![],
             on_connect_script: None,
             on_idle_script: None,
+            link: Default::default(),
+            link_path: None,
         }],
         idle_minutes: None,
         offline_minutes: None,
@@ -2038,7 +2269,8 @@ fn HomePage() -> impl IntoView {
     });
 
     view! {
-        <Header set_machine=set_machine registred_machines=registred_machines />
+        <Header />
+        <ServicesCard machines=registred_machines status_machine=status_machine />
         <Show when=move || { !registred_machines.get().is_empty() } fallback=|| view! {}>
             <RegistredMachines
                 machines=registred_machines
@@ -2048,6 +2280,7 @@ fn HomePage() -> impl IntoView {
         </Show>
         <AddMachine
             machine=machine
+            set_machine=set_machine
             registred_machines=registred_machines
             set_registred_machines=set_registred_machines
         />

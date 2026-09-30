@@ -19,6 +19,66 @@ pub struct PortForward {
     /// period after the script and is cancelled by activity during it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_idle_script: Option<String>,
+    /// How the web UI links to the forwarded service.
+    #[serde(default, skip_serializing_if = "LinkScheme::is_default")]
+    pub link: LinkScheme,
+    /// Path the link opens, e.g. `/lab`. Defaults to `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_path: Option<String>,
+}
+
+/// Whether and how the web UI links to a forwarded service. Non-web
+/// forwards (SSH, databases) should be `Off`: a browser can't open them.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkScheme {
+    #[default]
+    Http,
+    Https,
+    Off,
+}
+
+impl LinkScheme {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl PortForward {
+    /// URL of the forwarded service as reached through the wakezilla server
+    /// at `host`, the host the browser uses for wakezilla itself. Going
+    /// through the forward (rather than to the machine directly) is what
+    /// wakes the machine and runs its connect script. `None` for forwards
+    /// without a link.
+    pub fn link_url(&self, host: &str) -> Option<String> {
+        let scheme = match self.link {
+            LinkScheme::Http => "http",
+            LinkScheme::Https => "https",
+            LinkScheme::Off => return None,
+        };
+        // IPv6 literals need brackets in URLs.
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let path = self
+            .link_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/");
+        let slash = if path.starts_with('/') { "" } else { "/" };
+        Some(format!("{scheme}://{host}:{}{slash}{path}", self.local_port))
+    }
+
+    /// Link text: "Machine · Service", or "Machine · port N" for an unnamed forward.
+    pub fn link_label(&self, machine_name: &str) -> String {
+        match self.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) => format!("{machine_name} · {name}"),
+            None => format!("{machine_name} · port {}", self.local_port),
+        }
+    }
 }
 
 /// Request from the proxy asking a client server to run a port-forward script.
